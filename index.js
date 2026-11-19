@@ -95,7 +95,7 @@ app.patch("/tuitions/:id/status", async (req, res) => {
             });
         }
 
-        const result = await tuitionsCollection.updateOne(
+        const result = await tutions.updateOne(
             { _id: new ObjectId(id) },
             {
                 $set: {
@@ -130,6 +130,42 @@ app.patch("/tuitions/:id/status", async (req, res) => {
 app.get('/all-tuitions', async (req, res) => {
     const result = await tutions.find().toArray();
     res.send(result);
+});
+
+app.get("/tuition/:id", async (req, res) => {
+
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid tuition ID",
+            });
+        }
+
+        const result = await tutions.findOne({ _id: new ObjectId(id) });
+
+        if (!result) {
+            return res.status(404).send({
+                success: false,
+                message: "Tuition not found",
+            });
+        }
+
+        res.send({
+            success: true,
+            data: result,
+        });
+
+    } catch (error) {
+        console.error("Single tuition error:", error);
+
+        res.status(500).send({
+            success: false,
+            message: "Failed to fetch tuition",
+        });
+    }
 });
 
 // tutions get (supports ?status=... and ?tutorEmail=...)
