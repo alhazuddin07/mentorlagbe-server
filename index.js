@@ -58,7 +58,7 @@ app.patch('/users/:id/status', async (req, res) => {
     res.send(result)
 })
 
-// tutions post
+// tutions releted api
 app.post('/tutions', async (req, res) => {
     const newTuition = {
         ...req.body,
@@ -73,7 +73,7 @@ app.post('/tutions', async (req, res) => {
     res.send(result);
 })
 
-app.get('/appplications', async(req, res)=> {
+app.get('/appplications', async (req, res) => {
     const result = await appplicationCollection.find().toArray();
     res.send(result)
 })
@@ -132,11 +132,52 @@ app.patch("/tuitions/:id/status", async (req, res) => {
 });
 
 // apply for tuition
-app.post('/apply-tuitions', async(req, res)=> {
+app.post('/apply-tuitions', async (req, res) => {
     const user = req.body;
     const result = await appplicationCollection.insertOne(user);
     res.send(result);
 })
+
+app.patch("/applications/:id/status", async (req, res) => {
+    try {
+        const id = req.params.id;
+        const { status } = req.body;
+
+        const allowedStatus = ["Accepted", "Declined"];
+
+        if (!allowedStatus.includes(status)) {
+            return res.status(400).send({
+                message: "Invalid application status"
+            });
+        }
+
+        const result = await appplicationCollection.updateOne(
+            {
+                _id: new ObjectId(id),
+                status: "Awaiting Decision"
+            },
+            {
+                $set: { status }
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).send({
+                message: "Application not found or already reviewed"
+            });
+        }
+
+        res.send({
+            message: "Application status updated successfully",
+            result
+        });
+
+    } catch (error) {
+        res.status(500).send({
+            message: "Something went wrong"
+        });
+    }
+});
 
 app.get('/all-tuitions', async (req, res) => {
     const result = await tutions.find().toArray();
