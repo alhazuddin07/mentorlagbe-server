@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { application } from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
 import 'dotenv/config';
@@ -73,10 +73,6 @@ app.post('/tutions', async (req, res) => {
     res.send(result);
 })
 
-app.get('/appplications', async (req, res) => {
-    const result = await appplicationCollection.find().toArray();
-    res.send(result)
-})
 
 app.patch("/tuitions/:id/status", async (req, res) => {
     try {
@@ -90,7 +86,7 @@ app.patch("/tuitions/:id/status", async (req, res) => {
                 message: "Invalid tuition ID",
             });
         }
-
+        
         // Validate status
         if (!["approved", "rejected"].includes(approvalStatus)) {
             return res.status(400).send({
@@ -98,7 +94,7 @@ app.patch("/tuitions/:id/status", async (req, res) => {
                 message: "Invalid approval status",
             });
         }
-
+        
         const result = await tutions.updateOne(
             { _id: new ObjectId(id) },
             {
@@ -108,22 +104,22 @@ app.patch("/tuitions/:id/status", async (req, res) => {
                 },
             }
         );
-
+        
         if (result.matchedCount === 0) {
             return res.status(404).send({
                 success: false,
                 message: "Tuition not found",
             });
         }
-
+        
         res.status(200).send({
             success: true,
             message: `Tuition ${approvalStatus} successfully`,
         });
-
+        
     } catch (error) {
         console.error("Tuition status update error:", error);
-
+        
         res.status(500).send({
             success: false,
             message: "Failed to update tuition status",
@@ -131,12 +127,28 @@ app.patch("/tuitions/:id/status", async (req, res) => {
     }
 });
 
-// apply for tuition
-app.post('/apply-tuitions', async (req, res) => {
-    const user = req.body;
-    const result = await appplicationCollection.insertOne(user);
-    res.send(result);
+app.get('/tuitions/:id/applications/count', async(req, res) => {
+    try {
+        const tuitionId = req.params.id;
+
+        const count = await appplicationCollection.countDocuments({
+            tuitionId: tuitionId
+        });
+
+        res.send({ count });
+    } catch (error) {
+        res.status(500).send({
+            message: "Failed to get application count"
+        });
+    }
 })
+
+
+// application releted api
+app.get('/appplications', async (req, res) => {
+    const result = await appplicationCollection.find().toArray();
+    res.send(result)
+});
 
 app.patch("/applications/:id/status", async (req, res) => {
     try {
@@ -178,6 +190,14 @@ app.patch("/applications/:id/status", async (req, res) => {
         });
     }
 });
+
+// tuition releted api
+app.post('/apply-tuitions', async (req, res) => {
+    const user = req.body;
+    const result = await appplicationCollection.insertOne(user);
+    res.send(result);
+})
+
 
 app.get('/all-tuitions', async (req, res) => {
     const result = await tutions.find().toArray();
