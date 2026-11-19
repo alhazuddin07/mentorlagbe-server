@@ -25,6 +25,7 @@ const connectClient = await connectToMongoDB();
 const db = connectClient.db("mentor-lagbe");
 const tutions = db.collection("tutions");
 const user = db.collection("user");
+const appplicationCollection = db.collection("appplications")
 
 
 // users releted api
@@ -39,8 +40,6 @@ app.get('/users', async (req, res) => {
         status: item.status || "active",
         createdAt: item.createdAt,
     }));
-
-    console.log(JSON.stringify(result, null, 2));
 
     res.send(result);
 })
@@ -72,6 +71,11 @@ app.post('/tutions', async (req, res) => {
 
     const result = await tutions.insertOne(newTuition);
     res.send(result);
+})
+
+app.get('/appplications', async(req, res)=> {
+    const result = await appplicationCollection.find().toArray();
+    res.send(result)
 })
 
 app.patch("/tuitions/:id/status", async (req, res) => {
@@ -127,43 +131,37 @@ app.patch("/tuitions/:id/status", async (req, res) => {
     }
 });
 
+// apply for tuition
+app.post('/apply-tuitions', async(req, res)=> {
+    const user = req.body;
+    const result = await appplicationCollection.insertOne(user);
+    res.send(result);
+})
+
 app.get('/all-tuitions', async (req, res) => {
     const result = await tutions.find().toArray();
     res.send(result);
 });
 
-app.get("/tuition/:id", async (req, res) => {
-
+app.get("/tuitions/:id", async (req, res) => {
     try {
-        const { id } = req.params;
+        const id = req.params.id;
 
-        if (!ObjectId.isValid(id)) {
-            return res.status(400).send({
-                success: false,
-                message: "Invalid tuition ID",
-            });
-        }
-
-        const result = await tutions.findOne({ _id: new ObjectId(id) });
+        const result = await tutions.findOne({
+            _id: new ObjectId(id)
+        });
 
         if (!result) {
             return res.status(404).send({
-                success: false,
-                message: "Tuition not found",
+                message: "Tuition not found"
             });
         }
 
-        res.send({
-            success: true,
-            data: result,
-        });
+        res.send(result);
 
     } catch (error) {
-        console.error("Single tuition error:", error);
-
         res.status(500).send({
-            success: false,
-            message: "Failed to fetch tuition",
+            message: "Something went wrong"
         });
     }
 });
