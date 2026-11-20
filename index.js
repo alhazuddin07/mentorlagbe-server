@@ -2,6 +2,9 @@ import express, { application } from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
 import 'dotenv/config';
+import Stripe from "stripe";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
 const app = express()
 const PORT = process.env.PORT || 5000;
@@ -25,7 +28,8 @@ const connectClient = await connectToMongoDB();
 const db = connectClient.db("mentor-lagbe");
 const tutions = db.collection("tutions");
 const user = db.collection("user");
-const appplicationCollection = db.collection("appplications")
+const appplicationCollection = db.collection("appplications");
+const paymentsCollection = db.collection("payments")
 
 
 // users releted api
@@ -41,6 +45,13 @@ app.get('/users', async (req, res) => {
         createdAt: item.createdAt,
     }));
 
+    res.send(result);
+})
+
+app.get('/users/:id/premium', async(req, res) =>{
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+    const result = await user.findOne(query, { projection: { premium: 1}});
     res.send(result);
 })
 
@@ -86,7 +97,7 @@ app.patch("/tuitions/:id/status", async (req, res) => {
                 message: "Invalid tuition ID",
             });
         }
-        
+
         // Validate status
         if (!["approved", "rejected"].includes(approvalStatus)) {
             return res.status(400).send({
@@ -94,7 +105,7 @@ app.patch("/tuitions/:id/status", async (req, res) => {
                 message: "Invalid approval status",
             });
         }
-        
+
         const result = await tutions.updateOne(
             { _id: new ObjectId(id) },
             {
@@ -104,22 +115,22 @@ app.patch("/tuitions/:id/status", async (req, res) => {
                 },
             }
         );
-        
+
         if (result.matchedCount === 0) {
             return res.status(404).send({
                 success: false,
                 message: "Tuition not found",
             });
         }
-        
+
         res.status(200).send({
             success: true,
             message: `Tuition ${approvalStatus} successfully`,
         });
-        
+
     } catch (error) {
         console.error("Tuition status update error:", error);
-        
+
         res.status(500).send({
             success: false,
             message: "Failed to update tuition status",
@@ -127,7 +138,7 @@ app.patch("/tuitions/:id/status", async (req, res) => {
     }
 });
 
-app.get('/tuitions/:id/applications/count', async(req, res) => {
+app.get("/tutions/:id/applications/count", async (req, res) => {
     try {
         const tuitionId = req.params.id;
 
@@ -136,11 +147,38 @@ app.get('/tuitions/:id/applications/count', async(req, res) => {
         });
 
         res.send({ count });
+
     } catch (error) {
         res.status(500).send({
             message: "Failed to get application count"
         });
     }
+});
+
+app.get("/applications/count/:email", async (req, res) => {
+    try {
+        const email = req.params.email;
+
+        const count = await appplicationCollection.countDocuments({
+            studentEmail: email
+        });
+
+        res.send({ count });
+
+    } catch (error) {
+        res.status(500).send({
+            message: "Failed to get application count"
+        });
+    }
+});
+
+app.get('/appplications/count', async (req, res) => {
+    const query = {};
+    if (req.query.applicantId) {
+        query.userId = req.query.applicantId;
+    }
+    const result = await appplicationCollection.countDocuments(query);
+    res.send({ count: result });
 })
 
 
@@ -264,6 +302,91 @@ app.get("/browse-tuitions", async (req, res) => {
         res.status(500).send({
             success: false,
             message: "Failed to fetch tuitions",
+        });
+    }
+});
+
+// payments releted api
+
+app.post('/payments/checkout-verify', async (req, res) => {
+    try {
+        const { sessionId } = req.body;
+
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+        const {
+            status,
+            payment_status,
+            customer_email,
+            metadata,
+            payment_intent
+        } = session;
+
+        // Verify payment
+        if (status !== "complete" || payment_status !== "paid") {
+            return res.send({
+                success: false,
+                message: "Payment verification failed"
+            });
+        }
+
+        // Check user ID
+        if (!metadata?.userId) {
+            return res.status(400).send({
+                success: false,
+                message: "User ID missing from payment metadata"
+            });
+        }
+
+        // Prevent duplicate payment records
+        const existingPayment = await paymentsCollection.findOne({ sessionId });
+
+        if (existingPayment) {
+            return res.send({
+                success: false,
+                message: "Payment already verified"
+            });
+        }
+
+        const payment = {
+            sessionId,
+            status,
+            payment_status,
+            customer_email,
+            userId: metadata.userId,
+            payment_date: new Date(),
+            payment_intent
+        };
+
+        const result = await paymentsCollection.insertOne(payment);
+
+        const query = {
+            _id: new ObjectId(metadata.userId)
+        };
+
+        const updateDoc = {
+            $set: {
+                premium: true
+            }
+        };
+
+        const updateResult = await user.updateOne(
+            query,
+            updateDoc
+        );
+
+        res.send({
+            success: true,
+            result,
+            updateResult
+        });
+
+    } catch (error) {
+        console.error("Payment verification error:", error);
+
+        res.status(500).send({
+            success: false,
+            message: "Internal server error"
         });
     }
 });
