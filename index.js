@@ -48,10 +48,10 @@ app.get('/users', async (req, res) => {
     res.send(result);
 })
 
-app.get('/users/:id/premium', async(req, res) =>{
+app.get('/users/:id/premium', async (req, res) => {
     const id = req.params.id;
     const query = { _id: new ObjectId(id) };
-    const result = await user.findOne(query, { projection: { premium: 1}});
+    const result = await user.findOne(query, { projection: { premium: 1 } });
     res.send(result);
 })
 
@@ -308,85 +308,141 @@ app.get("/browse-tuitions", async (req, res) => {
 
 // payments releted api
 
+
 app.post('/payments/checkout-verify', async (req, res) => {
     try {
         const { sessionId } = req.body;
 
-        const session = await stripe.checkout.sessions.retrieve(sessionId);
+        if (!sessionId) {
+            return res.status(400).send({
+                success: false,
+                message: 'Session ID is required'
+            });
+        }
+
+        // Retrieve Stripe session
+        const session = await stripe.checkout.sessions.retrieve(
+            sessionId,
+            { expand: ['payment_intent'] }
+        );
 
         const {
             status,
             payment_status,
             customer_email,
+            customer_details,
             metadata,
-            payment_intent
+            payment_intent,
+            amount_total,
+            currency
         } = session;
 
         // Verify payment
-        if (status !== "complete" || payment_status !== "paid") {
-            return res.send({
+        if (status !== 'complete' || payment_status !== 'paid') {
+            return res.status(400).send({
                 success: false,
-                message: "Payment verification failed"
+                message: 'Payment verification failed'
             });
         }
 
-        // Check user ID
+        // Check user information
         if (!metadata?.userId) {
             return res.status(400).send({
                 success: false,
-                message: "User ID missing from payment metadata"
+                message: 'User ID missing from payment metadata'
             });
         }
 
-        // Prevent duplicate payment records
-        const existingPayment = await paymentsCollection.findOne({ sessionId });
+        // Older checkouts only stored the user id in metadata, so fall back to
+        // the user document for the name/role shown on the success page.
+        const userDoc = ObjectId.isValid(metadata.userId)
+            ? await user.findOne({ _id: new ObjectId(metadata.userId) })
+            : null;
+
+        const userName = metadata.userName || userDoc?.name;
+        const userRole = metadata.userRole || userDoc?.role;
+        const planName = metadata.planName || 'MentorLagbe Pro Plan';
+
+        // Check duplicate payment
+        const existingPayment = await paymentsCollection.findOne({
+            stripeSessionId: session.id
+        });
 
         if (existingPayment) {
+            // Backfill details that older payment records are missing.
+            const updates = {};
+
+            if (!existingPayment.userName) updates.userName = userName;
+            if (!existingPayment.userRole) updates.userRole = userRole;
+            if (!existingPayment.planName) updates.planName = planName;
+
+            if (Object.keys(updates).length > 0) {
+                await paymentsCollection.updateOne(
+                    { _id: existingPayment._id },
+                    { $set: updates }
+                );
+
+                Object.assign(existingPayment, updates);
+            }
+
             return res.send({
-                success: false,
-                message: "Payment already verified"
+                success: true,
+                alreadyVerified: true,
+                message: 'Payment already verified',
+                payment: existingPayment
             });
         }
 
+        // Prepare payment data
         const payment = {
-            sessionId,
-            status,
-            payment_status,
-            customer_email,
             userId: metadata.userId,
-            payment_date: new Date(),
-            payment_intent
+            userEmail: customer_details?.email || customer_email,
+            userName,
+            userRole,
+            planName,
+
+            amount: amount_total,
+            currency: currency,
+
+            transactionId:
+                typeof payment_intent === 'string'
+                    ? payment_intent
+                    : payment_intent?.id,
+
+            stripeSessionId: session.id,
+            paymentStatus: payment_status,
+            paidAt: new Date()
         };
 
-        const result = await paymentsCollection.insertOne(payment);
+        // Save payment
+        await paymentsCollection.insertOne(payment);
 
-        const query = {
-            _id: new ObjectId(metadata.userId)
-        };
-
-        const updateDoc = {
-            $set: {
-                premium: true
+        // Update premium status
+        await user.updateOne(
+            {
+                _id: new ObjectId(metadata.userId)
+            },
+            {
+                $set: {
+                    premium: true
+                }
             }
-        };
-
-        const updateResult = await user.updateOne(
-            query,
-            updateDoc
         );
 
-        res.send({
+        // Send response
+        return res.send({
             success: true,
-            result,
-            updateResult
+            alreadyVerified: false,
+            message: 'Payment verified successfully',
+            payment
         });
 
     } catch (error) {
-        console.error("Payment verification error:", error);
+        console.error('Payment verification error:', error);
 
-        res.status(500).send({
+        return res.status(500).send({
             success: false,
-            message: "Internal server error"
+            message: 'Internal server error'
         });
     }
 });
