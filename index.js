@@ -1,4 +1,4 @@
-import express, { application } from 'express';
+import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import cors from 'cors';
 import 'dotenv/config';
@@ -208,6 +208,7 @@ app.get("/tutions/:id/applications/count", async (req, res) => {
     }
 });
 
+// applica releted api
 app.get("/applications/count/:email", async (req, res) => {
     try {
         const email = req.params.email;
@@ -234,11 +235,35 @@ app.get('/appplications/count', async (req, res) => {
     res.send({ count: result });
 })
 
+app.get('/applications/student/:email', async (req, res) => {
+    try {
+        const email = req.params.email;
+        if (!email) {
+            return res.status(400).send({ message: "Email parameter is required" });
+        }
+        const result = await appplicationCollection
+            .find({ studentEmail: { $regex: new RegExp(`^${email}$`, "i") } })
+            .sort({ appliedDate: -1 })
+            .toArray();
+        res.send(result);
+    } catch (error) {
+        console.error("Error fetching student applications:", error);
+        res.status(500).send({ message: "Failed to fetch student applications" });
+    }
+});
 
-// application releted api
 app.get('/appplications', async (req, res) => {
-    const result = await appplicationCollection.find().toArray();
-    res.send(result)
+    try {
+        const query = {};
+        const email = req.query.email || req.query.studentEmail;
+        if (email) {
+            query.studentEmail = { $regex: new RegExp(`^${email}$`, "i") };
+        }
+        const result = await appplicationCollection.find(query).sort({ appliedDate: -1 }).toArray();
+        res.send(result);
+    } catch (err) {
+        res.status(500).send({ message: "Failed to fetch applications" });
+    }
 });
 
 app.patch("/applications/:id/status", async (req, res) => {
