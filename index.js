@@ -70,18 +70,71 @@ app.patch('/users/:id/status', async (req, res) => {
 })
 
 // tutions releted api
-app.post('/tutions', async (req, res) => {
-    const newTuition = {
-        ...req.body,
-        tutorName: req.body.tutorName,
-        tutorEmail: req.body.tutorEmail,
-        approvalStatus: "pending",
-        isActive: true,
-        createdAt: new Date(),
-    };
 
-    const result = await tutions.insertOne(newTuition);
-    res.send(result);
+const FREE_TUITION_LIMIT = 2;
+
+app.post('/tutions', async (req, res) => {
+    try {
+        const { tutorId } = req.body;
+
+        if (!tutorId) {
+            return res.status(400).send({
+                success: false,
+                message: 'Tutor ID is required'
+            });
+        }
+
+        const tutor = ObjectId.isValid(tutorId)
+            ? await user.findOne(
+                { _id: new ObjectId(tutorId) },
+                { projection: { premium: 1 } }
+            )
+            : null;
+
+        // Free tutors can post 3 tuitions. Pro (premium) tutors are unlimited.
+        if (!tutor?.premium) {
+            const postedCount = await tutions.countDocuments({ tutorId });
+
+            if (postedCount >= FREE_TUITION_LIMIT) {
+                return res.status(403).send({
+                    success: false,
+                    requiresPayment: true,
+                    message: `Free tutors can post ${FREE_TUITION_LIMIT} tuitions. Upgrade to Pro to post more.`
+                });
+            }
+        }
+
+        const newTuition = {
+            ...req.body,
+            tutorName: req.body.tutorName,
+            tutorEmail: req.body.tutorEmail,
+            approvalStatus: "pending",
+            isActive: true,
+            createdAt: new Date(),
+        };
+
+        const result = await tutions.insertOne(newTuition);
+        res.send(result);
+    } catch (error) {
+        console.error('Tuition create error:', error);
+        res.status(500).send({
+            success: false,
+            message: 'Failed to create tuition'
+        });
+    }
+})
+
+app.get('/tuitions/count/:tutorId', async (req, res) => {
+    try {
+        const count = await tutions.countDocuments({
+            tutorId: req.params.tutorId
+        });
+
+        res.send({ count });
+    } catch (error) {
+        console.error('Tuition count error:', error);
+        res.status(500).send({ message: 'Failed to get tuition count' });
+    }
 })
 
 
@@ -308,7 +361,6 @@ app.get("/browse-tuitions", async (req, res) => {
 
 // payments releted api
 
-
 app.post('/payments/checkout-verify', async (req, res) => {
     try {
         const { sessionId } = req.body;
@@ -353,8 +405,6 @@ app.post('/payments/checkout-verify', async (req, res) => {
             });
         }
 
-        // Older checkouts only stored the user id in metadata, so fall back to
-        // the user document for the name/role shown on the success page.
         const userDoc = ObjectId.isValid(metadata.userId)
             ? await user.findOne({ _id: new ObjectId(metadata.userId) })
             : null;
@@ -410,7 +460,7 @@ app.post('/payments/checkout-verify', async (req, res) => {
                     : payment_intent?.id,
 
             stripeSessionId: session.id,
-            paymentStatus: payment_status,
+            paymentStatus: "pro",
             paidAt: new Date()
         };
 
@@ -424,7 +474,8 @@ app.post('/payments/checkout-verify', async (req, res) => {
             },
             {
                 $set: {
-                    premium: true
+                    premium: true,
+                    plan: "paid",
                 }
             }
         );
