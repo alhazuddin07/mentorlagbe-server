@@ -29,7 +29,8 @@ const db = connectClient.db("mentor-lagbe");
 const tutions = db.collection("tutions");
 const user = db.collection("user");
 const appplicationCollection = db.collection("appplications");
-const paymentsCollection = db.collection("payments")
+const paymentsCollection = db.collection("payments");
+const bookmarksCollection = db.collection("bookmarks");
 
 
 // users releted api
@@ -263,6 +264,105 @@ app.get('/appplications', async (req, res) => {
         res.send(result);
     } catch (err) {
         res.status(500).send({ message: "Failed to fetch applications" });
+    }
+});
+
+// Bookmarks related APIs
+app.get('/bookmarks/:userIdentifier', async (req, res) => {
+    try {
+        const { userIdentifier } = req.params;
+        const query = {
+            $or: [
+                { userId: userIdentifier },
+                { userEmail: userIdentifier.toLowerCase() },
+            ],
+        };
+        const result = await bookmarksCollection.find(query).toArray();
+        res.send(result);
+    } catch (err) {
+        console.error("Error fetching bookmarks:", err);
+        res.status(500).send({ message: "Failed to fetch bookmarks" });
+    }
+});
+
+app.post('/bookmarks', async (req, res) => {
+    try {
+        const { userId, userEmail, tuitionId } = req.body;
+        if (!tuitionId) {
+            return res.status(400).send({ message: "tuitionId is required" });
+        }
+
+        const identifier = userId || userEmail;
+        if (!identifier) {
+            return res.status(400).send({ message: "User identification required" });
+        }
+
+        // Check user plan from user collection
+        const userDoc = userId && ObjectId.isValid(userId)
+            ? await user.findOne({ _id: new ObjectId(userId) })
+            : userEmail
+            ? await user.findOne({ email: userEmail.toLowerCase() })
+            : null;
+
+        const isPro = userDoc?.plan === "pro" || userDoc?.premium === true;
+
+        if (!isPro) {
+            const count = await bookmarksCollection.countDocuments({
+                $or: [
+                    { userId: identifier },
+                    { userEmail: (userEmail || identifier).toLowerCase() },
+                ],
+            });
+
+            if (count >= 5) {
+                return res.status(403).send({
+                    requiresPayment: true,
+                    message: "Free plan allows up to 5 bookmarks. Upgrade to Pro for unlimited bookmarks.",
+                });
+            }
+        }
+
+        const existing = await bookmarksCollection.findOne({
+            $or: [
+                { userId: identifier, tuitionId },
+                { userEmail: (userEmail || identifier).toLowerCase(), tuitionId },
+            ],
+        });
+
+        if (existing) {
+            return res.send({ success: true, message: "Already bookmarked", bookmark: existing });
+        }
+
+        const newBookmark = {
+            userId: userId || null,
+            userEmail: userEmail ? userEmail.toLowerCase() : null,
+            tuitionId,
+            createdAt: new Date(),
+        };
+
+        const result = await bookmarksCollection.insertOne(newBookmark);
+        res.send({ success: true, bookmarkId: result.insertedId });
+    } catch (err) {
+        console.error("Error creating bookmark:", err);
+        res.status(500).send({ message: "Failed to save bookmark" });
+    }
+});
+
+app.delete('/bookmarks/:userIdentifier/:tuitionId', async (req, res) => {
+    try {
+        const { userIdentifier, tuitionId } = req.params;
+        const query = {
+            tuitionId,
+            $or: [
+                { userId: userIdentifier },
+                { userEmail: userIdentifier.toLowerCase() },
+            ],
+        };
+        await bookmarksCollection.deleteOne(query);
+        res.send({ success: true, message: "Bookmark removed" });
+    } catch (err) {
+        console.error("Error deleting bookmark:", err);
+        res.status(500).send({ message: "Failed to delete bookmark" });
     }
 });
 
@@ -500,7 +600,7 @@ app.post('/payments/checkout-verify', async (req, res) => {
             {
                 $set: {
                     premium: true,
-                    plan: "paid",
+                    plan: "pro",
                 }
             }
         );
