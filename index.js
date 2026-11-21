@@ -498,6 +498,16 @@ app.post('/payments/checkout-verify', async (req, res) => {
     }
 });
 
+app.get('/payments', async (req, res) => {
+    try {
+        const result = await paymentsCollection.find().sort({ paidAt: -1 }).toArray();
+        res.send(result);
+    } catch (err) {
+        console.error("Error fetching payments:", err);
+        res.status(500).send({ message: "Failed to fetch payments" });
+    }
+});
+
 app.get('/', (req, res) => {
     res.send('Hello World!')
 })
