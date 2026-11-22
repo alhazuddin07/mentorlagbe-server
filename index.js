@@ -288,10 +288,7 @@ export async function connectToMongoDB() {
 const connectClient = await connectToMongoDB();
 const db = connectClient.db("mentor-lagbe");
 const tutions = db.collection("tutions");
-const tuitionsCollection = db.collection("tuitions");
 const user = db.collection("user");
-const usersCollection = db.collection("users");
-const appplicationCollection = db.collection("appplications");
 const applicationsCollection = db.collection("applications");
 const paymentsCollection = db.collection("payments");
 const bookmarksCollection = db.collection("bookmarks");
@@ -396,9 +393,6 @@ app.post('/tutions', async (req, res) => {
         };
 
         const result = await tutions.insertOne(newTuition);
-        try {
-            await tuitionsCollection.insertOne(newTuition);
-        } catch {}
 
         res.send({
             success: true,
@@ -459,18 +453,6 @@ app.patch("/tuitions/:id/status", async (req, res) => {
             }
         );
 
-        try {
-            await tuitionsCollection.updateOne(
-                { _id: new ObjectId(id) },
-                {
-                    $set: {
-                        approvalStatus,
-                        updatedAt: new Date(),
-                    },
-                }
-            );
-        } catch {}
-
         if (result.matchedCount === 0) {
             return res.status(404).send({
                 success: false,
@@ -497,7 +479,7 @@ app.get("/tutions/:id/applications/count", async (req, res) => {
     try {
         const tuitionId = req.params.id;
 
-        const count = await appplicationCollection.countDocuments({
+        const count = await applicationsCollection.countDocuments({
             tuitionId: tuitionId
         });
 
@@ -510,40 +492,13 @@ app.get("/tutions/:id/applications/count", async (req, res) => {
     }
 });
 
-// applica releted api
-app.get("/applications/count/:email", async (req, res) => {
-    try {
-        const email = req.params.email;
-
-        const count = await appplicationCollection.countDocuments({
-            studentEmail: email
-        });
-
-        res.send({ count });
-
-    } catch (error) {
-        res.status(500).send({
-            message: "Failed to get application count"
-        });
-    }
-});
-
-app.get('/appplications/count', async (req, res) => {
-    const query = {};
-    if (req.query.applicantId) {
-        query.userId = req.query.applicantId;
-    }
-    const result = await appplicationCollection.countDocuments(query);
-    res.send({ count: result });
-})
-
 app.get('/applications/student/:email', async (req, res) => {
     try {
         const email = req.params.email;
         if (!email) {
             return res.status(400).send({ message: "Email parameter is required" });
         }
-        const result = await appplicationCollection
+        const result = await applicationsCollection
             .find({ studentEmail: { $regex: new RegExp(`^${email}$`, "i") } })
             .sort({ appliedDate: -1 })
             .toArray();
@@ -561,7 +516,7 @@ app.get('/appplications', async (req, res) => {
         if (email) {
             query.studentEmail = { $regex: new RegExp(`^${email}$`, "i") };
         }
-        const result = await appplicationCollection.find(query).sort({ appliedDate: -1 }).toArray();
+        const result = await applicationsCollection.find(query).sort({ appliedDate: -1 }).toArray();
         res.send(result);
     } catch (err) {
         res.status(500).send({ message: "Failed to fetch applications" });
@@ -685,21 +640,12 @@ app.patch("/applications/:id/status", async (req, res) => {
             status: { $in: ["pending", "Awaiting Decision"] }
         };
 
-        const result = await appplicationCollection.updateOne(
+        const result = await applicationsCollection.updateOne(
             query,
             {
                 $set: { status, updatedAt: new Date() }
             }
         );
-
-        try {
-            await applicationsCollection.updateOne(
-                query,
-                {
-                    $set: { status, updatedAt: new Date() }
-                }
-            );
-        } catch {}
 
         if (result.matchedCount === 0) {
             return res.status(404).send({
@@ -739,7 +685,7 @@ app.post('/apply-tuitions', async (req, res) => {
         }
 
         // Prevent duplicate applications from the same student for the same tuition
-        const existingApp = await appplicationCollection.findOne({
+        const existingApp = await applicationsCollection.findOne({
             tuitionId: tuitionId,
             studentEmail: { $regex: new RegExp(`^${studentEmail.trim()}$`, "i") }
         });
@@ -777,16 +723,14 @@ app.post('/apply-tuitions', async (req, res) => {
             appliedDate: req.body.appliedDate ? new Date(req.body.appliedDate) : new Date(),
         };
 
-        const result = await appplicationCollection.insertOne(application);
-        try {
-            await applicationsCollection.insertOne(application);
-        } catch {}
+        const result = await applicationsCollection.insertOne(application);
 
         res.send({
             success: true,
             message: "Application submitted successfully",
             insertedId: result.insertedId
         });
+
     } catch (err) {
         console.error("Application create error:", err);
         res.status(500).send({
