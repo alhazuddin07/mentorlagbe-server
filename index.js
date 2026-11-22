@@ -11,266 +11,6 @@ const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 
-// Stripe Webhook endpoint with raw body parsing (MUST be before express.json())
-app.post(
-    '/payments/webhook',
-    express.raw({ type: 'application/json' }),
-    async (req, res) => {
-        const sig = req.headers['stripe-signature'];
-        const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-
-        let event;
-
-        try {
-            if (webhookSecret && sig) {
-                event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-            } else if (!webhookSecret) {
-                console.warn('[Stripe Webhook Server] STRIPE_WEBHOOK_SECRET not set. Processing event payload directly in test mode.');
-                event = JSON.parse(req.body.toString());
-            } else {
-                return res.status(400).send({ error: 'Missing stripe-signature header or webhook secret' });
-            }
-        } catch (err) {
-            console.error('[Stripe Webhook Server] Signature verification failed:', err.message);
-            return res.status(400).send(`Webhook Error: ${err.message}`);
-        }
-
-        try {
-            switch (event.type) {
-                case 'checkout.session.completed': {
-                    const session = event.data.object;
-                    if (session.mode === 'subscription') {
-                        const metadata = session.metadata || {};
-                        const userId = metadata.userId;
-                        const email = (session.customer_details?.email || metadata.userEmail || session.customer_email || '').toLowerCase();
-                        const userRole = (metadata.userRole || metadata.role || 'student').toLowerCase();
-                        const userName = metadata.userName || session.customer_details?.name || '';
-                        const planName = metadata.planName || (userRole === 'tutor' ? 'MentorLagbe Tutor Pro Plan' : 'MentorLagbe Student Pro Plan');
-                        const amount = session.amount_total ? session.amount_total / 100 : (userRole === 'tutor' ? 15 : 10);
-
-                        const stripeCustomerId = typeof session.customer === 'string' ? session.customer : session.customer?.id;
-                        const stripeSubscriptionId = typeof session.subscription === 'string' ? session.subscription : session.subscription?.id;
-                        const paymentIntentId = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id || null;
-
-                        // Idempotency check: prevent duplicate payment records
-                        const existing = await paymentsCollection.findOne({
-                            $or: [
-                                { stripeSessionId: session.id },
-                                { eventId: event.id }
-                            ]
-                        });
-
-                        if (!existing) {
-                            await paymentsCollection.insertOne({
-                                userId: userId || '',
-                                email,
-                                role: userRole,
-                                plan: 'pro',
-                                amount,
-                                currency: session.currency || 'usd',
-                                status: 'paid',
-                                stripeSessionId: session.id,
-                                stripeCustomerId: stripeCustomerId || null,
-                                stripeSubscriptionId: stripeSubscriptionId || null,
-                                paymentIntentId,
-                                eventId: event.id,
-                                userName,
-                                planName,
-                                paymentStatus: 'pro',
-                                paidAt: new Date(),
-                                createdAt: new Date()
-                            });
-                        }
-
-                        // Update user plan in DB
-                        const filter = userId && ObjectId.isValid(userId)
-                            ? { $or: [{ _id: new ObjectId(userId) }, { email }] }
-                            : { email };
-
-                        await user.updateOne(filter, {
-                            $set: {
-                                plan: 'pro',
-                                premium: true,
-                                stripeCustomerId: stripeCustomerId || undefined,
-                                stripeSubscriptionId: stripeSubscriptionId || undefined,
-                                subscriptionStatus: 'active',
-                                updatedAt: new Date()
-                            }
-                        });
-                    }
-                    break;
-                }
-
-                case 'invoice.payment_succeeded': {
-                    const invoice = event.data.object;
-                    const stripeSubscriptionId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
-                    const stripeCustomerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
-
-                    if (invoice.billing_reason === 'subscription_cycle' && stripeSubscriptionId) {
-                        const existing = await paymentsCollection.findOne({
-                            $or: [
-                                { invoiceId: invoice.id },
-                                { eventId: event.id }
-                            ]
-                        });
-
-                        if (!existing) {
-                            const userDoc = await user.findOne({
-                                $or: [
-                                    { stripeSubscriptionId },
-                                    { stripeCustomerId }
-                                ]
-                            });
-
-                            const userRole = userDoc?.role || 'student';
-                            const amount = invoice.amount_paid ? invoice.amount_paid / 100 : (userRole === 'tutor' ? 15 : 10);
-
-                            await paymentsCollection.insertOne({
-                                userId: userDoc?._id?.toString() || '',
-                                email: (invoice.customer_email || userDoc?.email || '').toLowerCase(),
-                                role: userRole,
-                                plan: 'pro',
-                                amount,
-                                currency: invoice.currency || 'usd',
-                                status: 'paid',
-                                stripeSessionId: null,
-                                stripeCustomerId: stripeCustomerId || null,
-                                stripeSubscriptionId,
-                                paymentIntentId: typeof invoice.payment_intent === 'string' ? invoice.payment_intent : invoice.payment_intent?.id || null,
-                                invoiceId: invoice.id,
-                                eventId: event.id,
-                                userName: userDoc?.name || '',
-                                planName: userRole === 'tutor' ? 'MentorLagbe Tutor Pro Plan' : 'MentorLagbe Student Pro Plan',
-                                paymentStatus: 'pro',
-                                paidAt: new Date(),
-                                createdAt: new Date()
-                            });
-                        }
-
-                        await user.updateOne(
-                            {
-                                $or: [
-                                    { stripeSubscriptionId },
-                                    { stripeCustomerId }
-                                ]
-                            },
-                            {
-                                $set: {
-                                    plan: 'pro',
-                                    premium: true,
-                                    subscriptionStatus: 'active',
-                                    updatedAt: new Date()
-                                }
-                            }
-                        );
-                    }
-                    break;
-                }
-
-                case 'invoice.payment_failed': {
-                    const invoice = event.data.object;
-                    const stripeSubscriptionId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
-                    const stripeCustomerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
-
-                    if (stripeSubscriptionId || stripeCustomerId) {
-                        await user.updateOne(
-                            {
-                                $or: [
-                                    { stripeSubscriptionId },
-                                    { stripeCustomerId }
-                                ]
-                            },
-                            {
-                                $set: {
-                                    subscriptionStatus: 'past_due',
-                                    updatedAt: new Date()
-                                }
-                            }
-                        );
-                    }
-                    break;
-                }
-
-                case 'customer.subscription.deleted': {
-                    const subscription = event.data.object;
-                    const stripeSubscriptionId = subscription.id;
-                    const stripeCustomerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id;
-
-                    await user.updateOne(
-                        {
-                            $or: [
-                                { stripeSubscriptionId },
-                                { stripeCustomerId }
-                            ]
-                        },
-                        {
-                            $set: {
-                                plan: 'free',
-                                premium: false,
-                                subscriptionStatus: 'canceled',
-                                updatedAt: new Date()
-                            }
-                        }
-                    );
-                    break;
-                }
-
-                case 'customer.subscription.updated': {
-                    const subscription = event.data.object;
-                    const stripeSubscriptionId = subscription.id;
-                    const stripeCustomerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id;
-                    const status = subscription.status;
-
-                    if (status === 'active') {
-                        await user.updateOne(
-                            {
-                                $or: [
-                                    { stripeSubscriptionId },
-                                    { stripeCustomerId }
-                                ]
-                            },
-                            {
-                                $set: {
-                                    plan: 'pro',
-                                    premium: true,
-                                    subscriptionStatus: 'active',
-                                    updatedAt: new Date()
-                                }
-                            }
-                        );
-                    } else if (status === 'canceled' || status === 'unpaid') {
-                        await user.updateOne(
-                            {
-                                $or: [
-                                    { stripeSubscriptionId },
-                                    { stripeCustomerId }
-                                ]
-                            },
-                            {
-                                $set: {
-                                    plan: 'free',
-                                    premium: false,
-                                    subscriptionStatus: status,
-                                    updatedAt: new Date()
-                                }
-                            }
-                        );
-                    }
-                    break;
-                }
-
-                default:
-                    break;
-            }
-
-            res.send({ received: true });
-        } catch (err) {
-            console.error('[Stripe Webhook Server] Error processing event:', err);
-            res.status(500).send({ error: 'Webhook processing failed' });
-        }
-    }
-);
-
 app.use(express.json());
 
 const client = new MongoClient(process.env.MONGODB_URI);
@@ -287,11 +27,65 @@ export async function connectToMongoDB() {
 
 const connectClient = await connectToMongoDB();
 const db = connectClient.db("mentor-lagbe");
+
 const tutions = db.collection("tutions");
 const user = db.collection("user");
 const applicationsCollection = db.collection("applications");
 const paymentsCollection = db.collection("payments");
 const bookmarksCollection = db.collection("bookmarks");
+const sessions = db.collection("session");
+
+
+const verifyToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+        res.send({ status: 401, message: "Unauthorized" });
+        return;
+    }
+    const token = authHeader.split(" ")[1];
+    if (!token) {
+        res.send({ status: 401, message: "Unauthorized" });
+        return;
+    }
+
+    const query = { token };
+    const session = await sessions.findOne(query);
+    if (!session) {
+        res.status(401).send({ message: "Unauthorized" });
+        return;
+    }
+
+    const userId = session.userId;
+    const userQuery = { _id: new ObjectId(userId) }
+    // NOTE: don't name this `user` — it would shadow the `user` collection
+    // declared above and throw a TDZ ReferenceError on every request.
+    const userDoc = await user.findOne(userQuery);
+    if (!userDoc) {
+        res.status(401).send({ message: "Unauthorized" });
+        return;
+    }
+
+    req.user = userDoc;
+
+    next();
+}
+
+
+const verifyStudent = async (req, res, next) => {
+    if (req.user.role !== "student") {
+        res.status(403).send({ message: 'Forbidden' });
+        return;
+    }
+    next();
+};
+
+const verifyTutor = async (req, res, next) => {
+    if (req.user.role !== "tutor") {
+        res.status(403).send({ message: 'Forbidden' });
+        return;
+    }
+    next();
+};
 
 
 // users releted api
@@ -335,7 +129,7 @@ app.patch('/users/:id/status', async (req, res) => {
 
 const FREE_TUITION_LIMIT = 2;
 
-app.post('/tutions', async (req, res) => {
+app.post('/tutions', verifyToken, verifyTutor, async (req, res) => {
     try {
         const { tutorId, tutorEmail } = req.body;
 
@@ -349,8 +143,8 @@ app.post('/tutions', async (req, res) => {
         const tutor = tutorId && ObjectId.isValid(tutorId)
             ? await user.findOne({ _id: new ObjectId(tutorId) })
             : tutorEmail
-            ? await user.findOne({ email: tutorEmail.toLowerCase() })
-            : null;
+                ? await user.findOne({ email: tutorEmail.toLowerCase() })
+                : null;
 
         // Role-based authorization: Only registered tutors (or admin) can post tuitions
         if (tutor && tutor.role && tutor.role !== "tutor" && tutor.role !== "admin") {
@@ -475,7 +269,7 @@ app.patch("/tuitions/:id/status", async (req, res) => {
     }
 });
 
-app.get("/tutions/:id/applications/count", async (req, res) => {
+app.get("/tutions/:id/applications/count", verifyToken, async (req, res) => {
     try {
         const tuitionId = req.params.id;
 
@@ -492,34 +286,123 @@ app.get("/tutions/:id/applications/count", async (req, res) => {
     }
 });
 
-app.get('/applications/student/:email', async (req, res) => {
+app.get('/applications', async (req, res) => {
     try {
-        const email = req.params.email;
-        if (!email) {
-            return res.status(400).send({ message: "Email parameter is required" });
+        const query = {};
+
+        if (req.query.applicantEmail) {
+            query.studentEmail = req.query.applicantEmail;
         }
-        const result = await applicationsCollection
-            .find({ studentEmail: { $regex: new RegExp(`^${email}$`, "i") } })
-            .sort({ appliedDate: -1 })
-            .toArray();
+
+        if (req.query.tuitionId) {
+            query.tuitionId = req.query.tuitionId;
+        }
+
+        const result = await applicationsCollection.find(query).toArray();
+
         res.send(result);
+
     } catch (error) {
-        console.error("Error fetching student applications:", error);
-        res.status(500).send({ message: "Failed to fetch student applications" });
+        res.status(500).send({
+            message: "Failed to fetch applications"
+        });
     }
 });
 
-app.get('/appplications', async (req, res) => {
+app.get('/applications', verifyToken, async (req, res) => {
+    const query = {};
+
+    if (req.query.applicantId) {
+        query.tuitionId = req.query.applicantId;
+    }
+
+    const cursor = applicationsCollection.find(query);
+    const result = await cursor.toArray();
+    res.send(result);
+
+});
+
+app.delete("/applications/:id", verifyToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid application ID",
+            });
+        }
+
+        const application = await applicationsCollection.findOne({
+            _id: new ObjectId(id),
+        });
+
+        if (!application) {
+            return res.status(404).send({
+                success: false,
+                message: "Application not found",
+            });
+        }
+
+        if (
+            req.user.role !== "student" ||
+            req.user.email.toLowerCase() !== application.studentEmail.toLowerCase()
+        ) {
+            return res.status(403).send({
+                success: false,
+                message: "You are not allowed to delete this application",
+            });
+        }
+
+        const result = await applicationsCollection.deleteOne({
+            _id: new ObjectId(id),
+            studentEmail: application.studentEmail,
+        });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).send({
+                success: false,
+                message: "Application could not be deleted",
+            });
+        }
+
+        res.send({
+            success: true,
+            message: "Application deleted successfully",
+        });
+
+    } catch (error) {
+        console.error("Delete application error:", error);
+
+        res.status(500).send({
+            success: false,
+            message: "Failed to delete application",
+        });
+    }
+});
+
+app.get('/applications/count', verifyToken, async (req, res) => {
     try {
         const query = {};
-        const email = req.query.email || req.query.studentEmail;
-        if (email) {
-            query.studentEmail = { $regex: new RegExp(`^${email}$`, "i") };
+
+        if (req.query.applicantId) {
+            query.studentEmail = req.user.email;
         }
-        const result = await applicationsCollection.find(query).sort({ appliedDate: -1 }).toArray();
-        res.send(result);
-    } catch (err) {
-        res.status(500).send({ message: "Failed to fetch applications" });
+
+        const result = await applicationsCollection.countDocuments(query);
+
+        res.send({
+            success: true,
+            count: result,
+        });
+
+    } catch (error) {
+        console.error("Application count error:", error);
+
+        res.status(500).send({
+            success: false,
+            message: "Failed to get application count",
+        });
     }
 });
 
@@ -557,8 +440,8 @@ app.post('/bookmarks', async (req, res) => {
         const userDoc = userId && ObjectId.isValid(userId)
             ? await user.findOne({ _id: new ObjectId(userId) })
             : userEmail
-            ? await user.findOne({ email: userEmail.toLowerCase() })
-            : null;
+                ? await user.findOne({ email: userEmail.toLowerCase() })
+                : null;
 
         const isPro = userDoc?.plan === "pro" || userDoc?.premium === true;
 
@@ -670,31 +553,10 @@ app.post('/apply-tuitions', async (req, res) => {
     try {
         const { tuitionId, studentEmail, tutorEmail } = req.body;
 
-        if (!tuitionId) {
-            return res.status(400).send({
-                success: false,
-                message: "Tuition ID is required"
-            });
-        }
-
         if (!studentEmail) {
             return res.status(400).send({
                 success: false,
-                message: "Student email is required"
-            });
-        }
-
-        // Prevent duplicate applications from the same student for the same tuition
-        const existingApp = await applicationsCollection.findOne({
-            tuitionId: tuitionId,
-            studentEmail: { $regex: new RegExp(`^${studentEmail.trim()}$`, "i") }
-        });
-
-        if (existingApp) {
-            return res.status(400).send({
-                success: false,
-                duplicate: true,
-                message: "You have already applied for this tuition."
+                message: "studentEmail is required"
             });
         }
 
@@ -770,7 +632,7 @@ app.get("/tuitions/:id", async (req, res) => {
 });
 
 // tutions get (supports ?status=... and ?tutorEmail=...)
-app.get('/tutions', async (req, res) => {
+app.get('/tutions', verifyToken, async (req, res) => {
     try {
         const query = {};
         if (req.query.status) {
@@ -811,7 +673,6 @@ app.get("/browse-tuitions", async (req, res) => {
 });
 
 // payments releted api
-
 app.post('/payments/checkout-verify', async (req, res) => {
     try {
         const { sessionId } = req.body;
