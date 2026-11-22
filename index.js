@@ -680,7 +680,7 @@ app.post('/payments/checkout-verify', async (req, res) => {
         if (!sessionId) {
             return res.status(400).send({
                 success: false,
-                message: 'Session ID is required'
+                message: "Session ID is required"
             });
         }
 
@@ -703,71 +703,108 @@ app.post('/payments/checkout-verify', async (req, res) => {
             customer
         } = session;
 
-        // Verify payment status
-        if (status !== 'complete' || payment_status !== 'paid') {
+        // Verify payment
+        if (status !== "complete" || payment_status !== "paid") {
             return res.status(400).send({
                 success: false,
-                message: 'Payment verification failed'
+                message: "Payment verification failed"
             });
         }
 
-        // Check if webhook already created the payment record
+        const userId = metadata?.userId;
+
+        if (!userId || !ObjectId.isValid(userId)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid user ID"
+            });
+        }
+
+        // Find user
+        const userDoc = await user.findOne({
+            _id: new ObjectId(userId)
+        });
+
+        if (!userDoc) {
+            return res.status(404).send({
+                success: false,
+                message: "User not found"
+            });
+        }
+
+        // Prevent duplicate payment records
         const existingPayment = await paymentsCollection.findOne({
             stripeSessionId: session.id
         });
 
         if (existingPayment) {
             return res.send({
-                success: true,
-                alreadyVerified: true,
-                message: 'Payment verified',
+                success: false,
+                message: "Payment already verified",
                 payment: existingPayment
             });
         }
 
-        const userDoc = metadata?.userId && ObjectId.isValid(metadata.userId)
-            ? await user.findOne({ _id: new ObjectId(metadata.userId) })
-            : null;
+        const userName = metadata?.userName || userDoc.name || "Customer";
+        const userRole = metadata?.userRole || userDoc.role || "student";
 
-        const userName = metadata?.userName || userDoc?.name || customer_details?.name || 'Customer';
-        const userRole = metadata?.userRole || metadata?.role || userDoc?.role || 'student';
-        const planName = metadata?.planName || (userRole === 'tutor' ? 'MentorLagbe Tutor Pro Plan' : 'MentorLagbe Student Pro Plan');
-        const amount = amount_total ? amount_total / 100 : (userRole === 'tutor' ? 15 : 10);
+        const planName = metadata?.planName ||
+            (userRole === "tutor"
+                ? "MentorLagbe Tutor Pro Plan"
+                : "MentorLagbe Student Pro Plan");
 
-        // Return details for receipt display without mutating user plan directly
-        const paymentDisplay = {
-            userId: metadata?.userId || userDoc?._id?.toString() || '',
-            email: customer_details?.email || customer_email || userDoc?.email,
-            userEmail: customer_details?.email || customer_email || userDoc?.email,
+        const paymentData = {
+            userId: userDoc._id.toString(),
+            email: userDoc.email,
+            userEmail: userDoc.email,
             userName,
             userRole,
             role: userRole,
             planName,
-            plan: 'pro',
-            amount,
-            currency: currency || 'usd',
-            transactionId: typeof payment_intent === 'string' ? payment_intent : payment_intent?.id || session.id,
+            plan: "pro",
+            amount: amount_total / 100,
+            currency: currency || "usd",
+            transactionId:
+                typeof payment_intent === "string"
+                    ? payment_intent
+                    : payment_intent?.id || session.id,
             stripeSessionId: session.id,
-            stripeCustomerId: typeof customer === 'string' ? customer : customer?.id,
-            stripeSubscriptionId: typeof subscription === 'string' ? subscription : subscription?.id,
-            paymentStatus: 'pro',
-            status: 'paid',
+            stripeCustomerId:
+                typeof customer === "string" ? customer : customer?.id,
+            stripeSubscriptionId:
+                typeof subscription === "string"
+                    ? subscription
+                    : subscription?.id,
+            paymentStatus: "paid",
+            status: "paid",
             paidAt: new Date()
         };
 
-        return res.send({
+        const result = await paymentsCollection.insertOne(paymentData);
+
+        // Update user premium status
+        await user.updateOne(
+            { _id: userDoc._id },
+            {
+                $set: {
+                    premium: true,
+                    plan: "pro"
+                }
+            }
+        );
+
+        res.send({
             success: true,
-            alreadyVerified: false,
-            message: 'Payment verified successfully',
-            payment: paymentDisplay
+            message: "Payment verified successfully",
+            result
         });
 
     } catch (error) {
-        console.error('Payment verification error:', error);
+        console.error("Payment verification error:", error);
 
-        return res.status(500).send({
+        res.status(500).send({
             success: false,
-            message: 'Internal server error'
+            message: "Internal server error"
         });
     }
 });
