@@ -9,8 +9,269 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express()
 const PORT = process.env.PORT || 5000;
 
-app.use(express.json());
 app.use(cors());
+
+// Stripe Webhook endpoint with raw body parsing (MUST be before express.json())
+app.post(
+    '/payments/webhook',
+    express.raw({ type: 'application/json' }),
+    async (req, res) => {
+        const sig = req.headers['stripe-signature'];
+        const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+        let event;
+
+        try {
+            if (webhookSecret && sig) {
+                event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+            } else if (!webhookSecret) {
+                console.warn('[Stripe Webhook Server] STRIPE_WEBHOOK_SECRET not set. Processing event payload directly in test mode.');
+                event = JSON.parse(req.body.toString());
+            } else {
+                return res.status(400).send({ error: 'Missing stripe-signature header or webhook secret' });
+            }
+        } catch (err) {
+            console.error('[Stripe Webhook Server] Signature verification failed:', err.message);
+            return res.status(400).send(`Webhook Error: ${err.message}`);
+        }
+
+        try {
+            switch (event.type) {
+                case 'checkout.session.completed': {
+                    const session = event.data.object;
+                    if (session.mode === 'subscription') {
+                        const metadata = session.metadata || {};
+                        const userId = metadata.userId;
+                        const email = (session.customer_details?.email || metadata.userEmail || session.customer_email || '').toLowerCase();
+                        const userRole = (metadata.userRole || metadata.role || 'student').toLowerCase();
+                        const userName = metadata.userName || session.customer_details?.name || '';
+                        const planName = metadata.planName || (userRole === 'tutor' ? 'MentorLagbe Tutor Pro Plan' : 'MentorLagbe Student Pro Plan');
+                        const amount = session.amount_total ? session.amount_total / 100 : (userRole === 'tutor' ? 15 : 10);
+
+                        const stripeCustomerId = typeof session.customer === 'string' ? session.customer : session.customer?.id;
+                        const stripeSubscriptionId = typeof session.subscription === 'string' ? session.subscription : session.subscription?.id;
+                        const paymentIntentId = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id || null;
+
+                        // Idempotency check: prevent duplicate payment records
+                        const existing = await paymentsCollection.findOne({
+                            $or: [
+                                { stripeSessionId: session.id },
+                                { eventId: event.id }
+                            ]
+                        });
+
+                        if (!existing) {
+                            await paymentsCollection.insertOne({
+                                userId: userId || '',
+                                email,
+                                role: userRole,
+                                plan: 'pro',
+                                amount,
+                                currency: session.currency || 'usd',
+                                status: 'paid',
+                                stripeSessionId: session.id,
+                                stripeCustomerId: stripeCustomerId || null,
+                                stripeSubscriptionId: stripeSubscriptionId || null,
+                                paymentIntentId,
+                                eventId: event.id,
+                                userName,
+                                planName,
+                                paymentStatus: 'pro',
+                                paidAt: new Date(),
+                                createdAt: new Date()
+                            });
+                        }
+
+                        // Update user plan in DB
+                        const filter = userId && ObjectId.isValid(userId)
+                            ? { $or: [{ _id: new ObjectId(userId) }, { email }] }
+                            : { email };
+
+                        await user.updateOne(filter, {
+                            $set: {
+                                plan: 'pro',
+                                premium: true,
+                                stripeCustomerId: stripeCustomerId || undefined,
+                                stripeSubscriptionId: stripeSubscriptionId || undefined,
+                                subscriptionStatus: 'active',
+                                updatedAt: new Date()
+                            }
+                        });
+                    }
+                    break;
+                }
+
+                case 'invoice.payment_succeeded': {
+                    const invoice = event.data.object;
+                    const stripeSubscriptionId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
+                    const stripeCustomerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
+
+                    if (invoice.billing_reason === 'subscription_cycle' && stripeSubscriptionId) {
+                        const existing = await paymentsCollection.findOne({
+                            $or: [
+                                { invoiceId: invoice.id },
+                                { eventId: event.id }
+                            ]
+                        });
+
+                        if (!existing) {
+                            const userDoc = await user.findOne({
+                                $or: [
+                                    { stripeSubscriptionId },
+                                    { stripeCustomerId }
+                                ]
+                            });
+
+                            const userRole = userDoc?.role || 'student';
+                            const amount = invoice.amount_paid ? invoice.amount_paid / 100 : (userRole === 'tutor' ? 15 : 10);
+
+                            await paymentsCollection.insertOne({
+                                userId: userDoc?._id?.toString() || '',
+                                email: (invoice.customer_email || userDoc?.email || '').toLowerCase(),
+                                role: userRole,
+                                plan: 'pro',
+                                amount,
+                                currency: invoice.currency || 'usd',
+                                status: 'paid',
+                                stripeSessionId: null,
+                                stripeCustomerId: stripeCustomerId || null,
+                                stripeSubscriptionId,
+                                paymentIntentId: typeof invoice.payment_intent === 'string' ? invoice.payment_intent : invoice.payment_intent?.id || null,
+                                invoiceId: invoice.id,
+                                eventId: event.id,
+                                userName: userDoc?.name || '',
+                                planName: userRole === 'tutor' ? 'MentorLagbe Tutor Pro Plan' : 'MentorLagbe Student Pro Plan',
+                                paymentStatus: 'pro',
+                                paidAt: new Date(),
+                                createdAt: new Date()
+                            });
+                        }
+
+                        await user.updateOne(
+                            {
+                                $or: [
+                                    { stripeSubscriptionId },
+                                    { stripeCustomerId }
+                                ]
+                            },
+                            {
+                                $set: {
+                                    plan: 'pro',
+                                    premium: true,
+                                    subscriptionStatus: 'active',
+                                    updatedAt: new Date()
+                                }
+                            }
+                        );
+                    }
+                    break;
+                }
+
+                case 'invoice.payment_failed': {
+                    const invoice = event.data.object;
+                    const stripeSubscriptionId = typeof invoice.subscription === 'string' ? invoice.subscription : invoice.subscription?.id;
+                    const stripeCustomerId = typeof invoice.customer === 'string' ? invoice.customer : invoice.customer?.id;
+
+                    if (stripeSubscriptionId || stripeCustomerId) {
+                        await user.updateOne(
+                            {
+                                $or: [
+                                    { stripeSubscriptionId },
+                                    { stripeCustomerId }
+                                ]
+                            },
+                            {
+                                $set: {
+                                    subscriptionStatus: 'past_due',
+                                    updatedAt: new Date()
+                                }
+                            }
+                        );
+                    }
+                    break;
+                }
+
+                case 'customer.subscription.deleted': {
+                    const subscription = event.data.object;
+                    const stripeSubscriptionId = subscription.id;
+                    const stripeCustomerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id;
+
+                    await user.updateOne(
+                        {
+                            $or: [
+                                { stripeSubscriptionId },
+                                { stripeCustomerId }
+                            ]
+                        },
+                        {
+                            $set: {
+                                plan: 'free',
+                                premium: false,
+                                subscriptionStatus: 'canceled',
+                                updatedAt: new Date()
+                            }
+                        }
+                    );
+                    break;
+                }
+
+                case 'customer.subscription.updated': {
+                    const subscription = event.data.object;
+                    const stripeSubscriptionId = subscription.id;
+                    const stripeCustomerId = typeof subscription.customer === 'string' ? subscription.customer : subscription.customer?.id;
+                    const status = subscription.status;
+
+                    if (status === 'active') {
+                        await user.updateOne(
+                            {
+                                $or: [
+                                    { stripeSubscriptionId },
+                                    { stripeCustomerId }
+                                ]
+                            },
+                            {
+                                $set: {
+                                    plan: 'pro',
+                                    premium: true,
+                                    subscriptionStatus: 'active',
+                                    updatedAt: new Date()
+                                }
+                            }
+                        );
+                    } else if (status === 'canceled' || status === 'unpaid') {
+                        await user.updateOne(
+                            {
+                                $or: [
+                                    { stripeSubscriptionId },
+                                    { stripeCustomerId }
+                                ]
+                            },
+                            {
+                                $set: {
+                                    plan: 'free',
+                                    premium: false,
+                                    subscriptionStatus: status,
+                                    updatedAt: new Date()
+                                }
+                            }
+                        );
+                    }
+                    break;
+                }
+
+                default:
+                    break;
+            }
+
+            res.send({ received: true });
+        } catch (err) {
+            console.error('[Stripe Webhook Server] Error processing event:', err);
+            res.status(500).send({ error: 'Webhook processing failed' });
+        }
+    }
+);
+
+app.use(express.json());
 
 const client = new MongoClient(process.env.MONGODB_URI);
 
@@ -27,8 +288,11 @@ export async function connectToMongoDB() {
 const connectClient = await connectToMongoDB();
 const db = connectClient.db("mentor-lagbe");
 const tutions = db.collection("tutions");
+const tuitionsCollection = db.collection("tuitions");
 const user = db.collection("user");
+const usersCollection = db.collection("users");
 const appplicationCollection = db.collection("appplications");
+const applicationsCollection = db.collection("applications");
 const paymentsCollection = db.collection("payments");
 const bookmarksCollection = db.collection("bookmarks");
 
@@ -76,46 +340,71 @@ const FREE_TUITION_LIMIT = 2;
 
 app.post('/tutions', async (req, res) => {
     try {
-        const { tutorId } = req.body;
+        const { tutorId, tutorEmail } = req.body;
 
-        if (!tutorId) {
+        if (!tutorId && !tutorEmail) {
             return res.status(400).send({
                 success: false,
-                message: 'Tutor ID is required'
+                message: 'Tutor ID or email is required'
             });
         }
 
-        const tutor = ObjectId.isValid(tutorId)
-            ? await user.findOne(
-                { _id: new ObjectId(tutorId) },
-                { projection: { premium: 1 } }
-            )
+        const tutor = tutorId && ObjectId.isValid(tutorId)
+            ? await user.findOne({ _id: new ObjectId(tutorId) })
+            : tutorEmail
+            ? await user.findOne({ email: tutorEmail.toLowerCase() })
             : null;
 
-        // Free tutors can post 3 tuitions. Pro (premium) tutors are unlimited.
-        if (!tutor?.premium) {
-            const postedCount = await tutions.countDocuments({ tutorId });
+        // Role-based authorization: Only registered tutors (or admin) can post tuitions
+        if (tutor && tutor.role && tutor.role !== "tutor" && tutor.role !== "admin") {
+            return res.status(403).send({
+                success: false,
+                message: "Only tutors can create tuition listings."
+            });
+        }
+
+        // Plan check: Pro tutors can post unlimited. Free tutors are limited to 2 tuitions.
+        const isPro = tutor?.plan === "pro" || tutor?.premium === true;
+
+        if (!isPro) {
+            const countQuery = {
+                $or: [
+                    ...(tutorId ? [{ tutorId }] : []),
+                    ...(tutorEmail ? [{ tutorEmail: tutorEmail.toLowerCase() }] : []),
+                    ...(tutor?.email ? [{ tutorEmail: tutor.email.toLowerCase() }] : [])
+                ]
+            };
+            const postedCount = await tutions.countDocuments(countQuery);
 
             if (postedCount >= FREE_TUITION_LIMIT) {
                 return res.status(403).send({
                     success: false,
                     requiresPayment: true,
-                    message: `Free tutors can post ${FREE_TUITION_LIMIT} tuitions. Upgrade to Pro to post more.`
+                    message: `Free tutors can post a maximum of ${FREE_TUITION_LIMIT} tuitions. Upgrade to Pro for unlimited tuitions.`
                 });
             }
         }
 
         const newTuition = {
             ...req.body,
-            tutorName: req.body.tutorName,
-            tutorEmail: req.body.tutorEmail,
+            tutorId: tutorId || tutor?._id?.toString(),
+            tutorName: req.body.tutorName || tutor?.name || "Tutor",
+            tutorEmail: (req.body.tutorEmail || tutor?.email || "").toLowerCase(),
             approvalStatus: "pending",
             isActive: true,
             createdAt: new Date(),
         };
 
         const result = await tutions.insertOne(newTuition);
-        res.send(result);
+        try {
+            await tuitionsCollection.insertOne(newTuition);
+        } catch {}
+
+        res.send({
+            success: true,
+            message: "Tuition posted successfully and submitted for admin review.",
+            insertedId: result.insertedId
+        });
     } catch (error) {
         console.error('Tuition create error:', error);
         res.status(500).send({
@@ -169,6 +458,18 @@ app.patch("/tuitions/:id/status", async (req, res) => {
                 },
             }
         );
+
+        try {
+            await tuitionsCollection.updateOne(
+                { _id: new ObjectId(id) },
+                {
+                    $set: {
+                        approvalStatus,
+                        updatedAt: new Date(),
+                    },
+                }
+            );
+        } catch {}
 
         if (result.matchedCount === 0) {
             return res.status(404).send({
@@ -379,15 +680,26 @@ app.patch("/applications/:id/status", async (req, res) => {
             });
         }
 
+        const query = {
+            _id: new ObjectId(id),
+            status: { $in: ["pending", "Awaiting Decision"] }
+        };
+
         const result = await appplicationCollection.updateOne(
+            query,
             {
-                _id: new ObjectId(id),
-                status: "Awaiting Decision"
-            },
-            {
-                $set: { status }
+                $set: { status, updatedAt: new Date() }
             }
         );
+
+        try {
+            await applicationsCollection.updateOne(
+                query,
+                {
+                    $set: { status, updatedAt: new Date() }
+                }
+            );
+        } catch {}
 
         if (result.matchedCount === 0) {
             return res.status(404).send({
@@ -407,12 +719,82 @@ app.patch("/applications/:id/status", async (req, res) => {
     }
 });
 
-// tuition releted api
+// tuition application api
 app.post('/apply-tuitions', async (req, res) => {
-    const user = req.body;
-    const result = await appplicationCollection.insertOne(user);
-    res.send(result);
-})
+    try {
+        const { tuitionId, studentEmail, tutorEmail } = req.body;
+
+        if (!tuitionId) {
+            return res.status(400).send({
+                success: false,
+                message: "Tuition ID is required"
+            });
+        }
+
+        if (!studentEmail) {
+            return res.status(400).send({
+                success: false,
+                message: "Student email is required"
+            });
+        }
+
+        // Prevent duplicate applications from the same student for the same tuition
+        const existingApp = await appplicationCollection.findOne({
+            tuitionId: tuitionId,
+            studentEmail: { $regex: new RegExp(`^${studentEmail.trim()}$`, "i") }
+        });
+
+        if (existingApp) {
+            return res.status(400).send({
+                success: false,
+                duplicate: true,
+                message: "You have already applied for this tuition."
+            });
+        }
+
+        // Retrieve tuition details to ensure tutorEmail is stored and prevent self-application
+        let resolvedTutorEmail = tutorEmail;
+        if (ObjectId.isValid(tuitionId)) {
+            const tuitionDoc = await tutions.findOne({ _id: new ObjectId(tuitionId) });
+            if (!resolvedTutorEmail) {
+                resolvedTutorEmail = tuitionDoc?.tutorEmail || null;
+            }
+        }
+
+        if (resolvedTutorEmail && resolvedTutorEmail.toLowerCase() === studentEmail.trim().toLowerCase()) {
+            return res.status(400).send({
+                success: false,
+                message: "You cannot apply for your own tuition listing."
+            });
+        }
+
+        const application = {
+            ...req.body,
+            tuitionId,
+            tutorEmail: resolvedTutorEmail,
+            studentEmail: studentEmail.trim().toLowerCase(),
+            status: "pending",
+            appliedDate: req.body.appliedDate ? new Date(req.body.appliedDate) : new Date(),
+        };
+
+        const result = await appplicationCollection.insertOne(application);
+        try {
+            await applicationsCollection.insertOne(application);
+        } catch {}
+
+        res.send({
+            success: true,
+            message: "Application submitted successfully",
+            insertedId: result.insertedId
+        });
+    } catch (err) {
+        console.error("Application create error:", err);
+        res.status(500).send({
+            success: false,
+            message: "Failed to submit application"
+        });
+    }
+});
 
 
 app.get('/all-tuitions', async (req, res) => {
@@ -500,7 +882,7 @@ app.post('/payments/checkout-verify', async (req, res) => {
         // Retrieve Stripe session
         const session = await stripe.checkout.sessions.retrieve(
             sessionId,
-            { expand: ['payment_intent'] }
+            { expand: ['payment_intent', 'subscription'] }
         );
 
         const {
@@ -511,10 +893,12 @@ app.post('/payments/checkout-verify', async (req, res) => {
             metadata,
             payment_intent,
             amount_total,
-            currency
+            currency,
+            subscription,
+            customer
         } = session;
 
-        // Verify payment
+        // Verify payment status
         if (status !== 'complete' || payment_status !== 'paid') {
             return res.status(400).send({
                 success: false,
@@ -522,95 +906,55 @@ app.post('/payments/checkout-verify', async (req, res) => {
             });
         }
 
-        // Check user information
-        if (!metadata?.userId) {
-            return res.status(400).send({
-                success: false,
-                message: 'User ID missing from payment metadata'
-            });
-        }
-
-        const userDoc = ObjectId.isValid(metadata.userId)
-            ? await user.findOne({ _id: new ObjectId(metadata.userId) })
-            : null;
-
-        const userName = metadata.userName || userDoc?.name;
-        const userRole = metadata.userRole || userDoc?.role;
-        const planName = metadata.planName || 'MentorLagbe Pro Plan';
-
-        // Check duplicate payment
+        // Check if webhook already created the payment record
         const existingPayment = await paymentsCollection.findOne({
             stripeSessionId: session.id
         });
 
         if (existingPayment) {
-            // Backfill details that older payment records are missing.
-            const updates = {};
-
-            if (!existingPayment.userName) updates.userName = userName;
-            if (!existingPayment.userRole) updates.userRole = userRole;
-            if (!existingPayment.planName) updates.planName = planName;
-
-            if (Object.keys(updates).length > 0) {
-                await paymentsCollection.updateOne(
-                    { _id: existingPayment._id },
-                    { $set: updates }
-                );
-
-                Object.assign(existingPayment, updates);
-            }
-
             return res.send({
                 success: true,
                 alreadyVerified: true,
-                message: 'Payment already verified',
+                message: 'Payment verified',
                 payment: existingPayment
             });
         }
 
-        // Prepare payment data
-        const payment = {
-            userId: metadata.userId,
-            userEmail: customer_details?.email || customer_email,
+        const userDoc = metadata?.userId && ObjectId.isValid(metadata.userId)
+            ? await user.findOne({ _id: new ObjectId(metadata.userId) })
+            : null;
+
+        const userName = metadata?.userName || userDoc?.name || customer_details?.name || 'Customer';
+        const userRole = metadata?.userRole || metadata?.role || userDoc?.role || 'student';
+        const planName = metadata?.planName || (userRole === 'tutor' ? 'MentorLagbe Tutor Pro Plan' : 'MentorLagbe Student Pro Plan');
+        const amount = amount_total ? amount_total / 100 : (userRole === 'tutor' ? 15 : 10);
+
+        // Return details for receipt display without mutating user plan directly
+        const paymentDisplay = {
+            userId: metadata?.userId || userDoc?._id?.toString() || '',
+            email: customer_details?.email || customer_email || userDoc?.email,
+            userEmail: customer_details?.email || customer_email || userDoc?.email,
             userName,
             userRole,
+            role: userRole,
             planName,
-
-            amount: amount_total,
-            currency: currency,
-
-            transactionId:
-                typeof payment_intent === 'string'
-                    ? payment_intent
-                    : payment_intent?.id,
-
+            plan: 'pro',
+            amount,
+            currency: currency || 'usd',
+            transactionId: typeof payment_intent === 'string' ? payment_intent : payment_intent?.id || session.id,
             stripeSessionId: session.id,
-            paymentStatus: "pro",
+            stripeCustomerId: typeof customer === 'string' ? customer : customer?.id,
+            stripeSubscriptionId: typeof subscription === 'string' ? subscription : subscription?.id,
+            paymentStatus: 'pro',
+            status: 'paid',
             paidAt: new Date()
         };
 
-        // Save payment
-        await paymentsCollection.insertOne(payment);
-
-        // Update premium status
-        await user.updateOne(
-            {
-                _id: new ObjectId(metadata.userId)
-            },
-            {
-                $set: {
-                    premium: true,
-                    plan: "pro",
-                }
-            }
-        );
-
-        // Send response
         return res.send({
             success: true,
             alreadyVerified: false,
             message: 'Payment verified successfully',
-            payment
+            payment: paymentDisplay
         });
 
     } catch (error) {
