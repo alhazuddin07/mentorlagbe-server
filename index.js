@@ -470,55 +470,46 @@ app.get("/tutions/:id/applications/count", verifyToken, verifyTutor, async (req,
 }
 );
 
+
 app.get('/applications', verifyToken, async (req, res) => {
     try {
         const query = {};
 
-        if (req.query.applicantEmail) {
-            query.studentEmail = req.query.applicantEmail;
-        }
+        if (req.user.role === "tutor") {
+            const tutorId = req.user._id.toString();
 
-        if (req.query.tuitionId) {
-            query.tuitionId = req.query.tuitionId;
-        }
+            const myTuitions = await tutions
+                .find({ tutorId })
+                .project({ _id: 1 })
+                .toArray();
 
-        const result = await applicationsCollection.find(query).toArray();
+            const tuitionIds = myTuitions.map(
+                (tuition) => tuition._id.toString()
+            );
 
-        res.send(result);
+            if (req.query.tuitionId) {
+                const tuitionId = req.query.tuitionId;
 
-    } catch (error) {
-        res.status(500).send({
-            message: "Failed to fetch applications"
-        });
-    }
-});
+                if (!tuitionIds.includes(tuitionId)) {
+                    return res.status(403).send({
+                        success: false,
+                        message: "You cannot access these applications",
+                    });
+                }
 
-app.get('/applications', verifyToken, verifyTutor, async (req, res) => {
-    try {
-        const tuitionId = req.query.applicantId;
+                query.tuitionId = tuitionId;
+            } else {
+                query.tuitionId = { $in: tuitionIds };
+            }
 
-        if (!tuitionId) {
-            return res.status(400).send({
-                success: false,
-                message: "Tuition ID is required",
-            });
-        }
-
-        // Check tuition ownership
-        const tuition = await tutions.findOne({
-            _id: new ObjectId(tuitionId),
-            tutorId: req.user._id.toString(),
-        });
-
-        if (!tuition) {
-            return res.status(403).send({
-                success: false,
-                message: "You cannot access these applications",
-            });
+        } else if (req.query.applicantEmail) {
+            // Student নিজের applications দেখতে পারবে
+            query.studentEmail = req.user.email;
         }
 
         const result = await applicationsCollection
-            .find({ tuitionId })
+            .find(query)
+            .sort({ appliedDate: -1 })
             .toArray();
 
         res.send(result);
@@ -874,53 +865,92 @@ app.patch("/applications/:id/status", verifyToken, verifyTutor, async (req, res)
 // tuition application api
 app.post('/apply-tuitions', verifyToken, verifyStudent, async (req, res) => {
     try {
-        const { tuitionId, studentEmail, tutorEmail } = req.body;
+        const { tuitionId } = req.body;
 
-        if (!studentEmail) {
+        // Validate tuition ID
+        if (!tuitionId || !ObjectId.isValid(tuitionId)) {
             return res.status(400).send({
                 success: false,
-                message: "studentEmail is required"
+                message: "Invalid tuition ID",
             });
         }
 
-        // Retrieve tuition details to ensure tutorEmail is stored and prevent self-application
-        let resolvedTutorEmail = tutorEmail;
-        if (ObjectId.isValid(tuitionId)) {
-            const tuitionDoc = await tutions.findOne({ _id: new ObjectId(tuitionId) });
-            if (!resolvedTutorEmail) {
-                resolvedTutorEmail = tuitionDoc?.tutorEmail || null;
-            }
+        // Get student email from authenticated user
+        const studentEmail = req.user.email.toLowerCase();
+
+        // Find tuition
+        const tuition = await tutions.findOne({
+            _id: new ObjectId(tuitionId),
+        });
+
+        if (!tuition) {
+            return res.status(404).send({
+                success: false,
+                message: "Tuition not found",
+            });
         }
 
-        if (resolvedTutorEmail && resolvedTutorEmail.toLowerCase() === studentEmail.trim().toLowerCase()) {
+        const tutorEmail = tuition.tutorEmail?.toLowerCase();
+
+        // Prevent self application
+        if (tutorEmail === studentEmail) {
             return res.status(400).send({
                 success: false,
-                message: "You cannot apply for your own tuition listing."
+                message: "You cannot apply for your own tuition",
+            });
+        }
+
+        // Check duplicate application
+        const existingApplication = await applicationsCollection.findOne({
+            tuitionId,
+            studentEmail,
+        });
+
+        if (existingApplication) {
+            return res.status(409).send({
+                success: false,
+                alreadyApplied: true,
+                message: "You have already applied for this tuition",
             });
         }
 
         const application = {
-            ...req.body,
             tuitionId,
-            tutorEmail: resolvedTutorEmail,
-            studentEmail: studentEmail.trim().toLowerCase(),
+            tutorEmail: tuition.tutorEmail,
+            studentEmail,
+            studentName: req.user.name,
+            phone: req.body.phone,
+            preferredSchedule: req.body.preferredSchedule,
+            learningNote: req.body.learningNote,
+            tuitionTitle: tuition.title,
+            classLavel: tuition.classLevel,
             status: "pending",
-            appliedDate: req.body.appliedDate ? new Date(req.body.appliedDate) : new Date(),
+            appliedDate: new Date(),
         };
 
         const result = await applicationsCollection.insertOne(application);
 
-        res.send({
+        return res.status(201).send({
             success: true,
             message: "Application submitted successfully",
-            insertedId: result.insertedId
+            insertedId: result.insertedId,
         });
 
-    } catch (err) {
-        console.error("Application create error:", err);
-        res.status(500).send({
+    } catch (error) {
+        // Handle duplicate key error
+        if (error.code === 11000) {
+            return res.status(409).send({
+                success: false,
+                alreadyApplied: true,
+                message: "You have already applied for this tuition",
+            });
+        }
+
+        console.error("Apply tuition error:", error);
+
+        return res.status(500).send({
             success: false,
-            message: "Failed to submit application"
+            message: "Failed to submit application",
         });
     }
 });
@@ -1177,6 +1207,7 @@ app.get("/browse-tuitions", async (req, res) => {
 });
 
 // payments releted api
+
 app.post('/payments/checkout-verify', verifyToken, async (req, res) => {
     try {
         const { sessionId } = req.body;
@@ -1188,17 +1219,16 @@ app.post('/payments/checkout-verify', verifyToken, async (req, res) => {
             });
         }
 
-        // Retrieve Stripe session
         const session = await stripe.checkout.sessions.retrieve(
             sessionId,
-            { expand: ['payment_intent', 'subscription'] }
+            {
+                expand: ['payment_intent', 'subscription']
+            }
         );
 
         const {
             status,
             payment_status,
-            customer_email,
-            customer_details,
             metadata,
             payment_intent,
             amount_total,
@@ -1207,7 +1237,6 @@ app.post('/payments/checkout-verify', verifyToken, async (req, res) => {
             customer
         } = session;
 
-        // Verify payment
         if (status !== "complete" || payment_status !== "paid") {
             return res.status(400).send({
                 success: false,
@@ -1224,7 +1253,13 @@ app.post('/payments/checkout-verify', verifyToken, async (req, res) => {
             });
         }
 
-        // Find user
+        if (userId !== req.user._id.toString()) {
+            return res.status(403).send({
+                success: false,
+                message: "You cannot verify another user's payment"
+            });
+        }
+
         const userDoc = await user.findOne({
             _id: new ObjectId(userId)
         });
@@ -1236,23 +1271,38 @@ app.post('/payments/checkout-verify', verifyToken, async (req, res) => {
             });
         }
 
-        // Prevent duplicate payment records
+        // Check if payment already exists
         const existingPayment = await paymentsCollection.findOne({
             stripeSessionId: session.id
         });
 
         if (existingPayment) {
-            return res.send({
-                success: false,
+            await user.updateOne(
+                { _id: userDoc._id },
+                {
+                    $set: {
+                        premium: true,
+                        plan: "pro"
+                    }
+                }
+            );
+
+            return res.status(200).send({
+                success: true,
                 message: "Payment already verified",
+                alreadyVerified: true,
                 payment: existingPayment
             });
         }
 
-        const userName = metadata?.userName || userDoc.name || "Customer";
-        const userRole = metadata?.userRole || userDoc.role || "student";
+        const userName =
+            metadata?.userName || userDoc.name || "Customer";
 
-        const planName = metadata?.planName ||
+        const userRole =
+            metadata?.userRole || userDoc.role || "student";
+
+        const planName =
+            metadata?.planName ||
             (userRole === "tutor"
                 ? "MentorLagbe Tutor Pro Plan"
                 : "MentorLagbe Student Pro Plan");
@@ -1268,17 +1318,24 @@ app.post('/payments/checkout-verify', verifyToken, async (req, res) => {
             plan: "pro",
             amount: amount_total / 100,
             currency: currency || "usd",
+
             transactionId:
                 typeof payment_intent === "string"
                     ? payment_intent
                     : payment_intent?.id || session.id,
+
             stripeSessionId: session.id,
+
             stripeCustomerId:
-                typeof customer === "string" ? customer : customer?.id,
+                typeof customer === "string"
+                    ? customer
+                    : customer?.id,
+
             stripeSubscriptionId:
                 typeof subscription === "string"
                     ? subscription
                     : subscription?.id,
+
             paymentStatus: "paid",
             status: "paid",
             paidAt: new Date()
@@ -1286,7 +1343,6 @@ app.post('/payments/checkout-verify', verifyToken, async (req, res) => {
 
         const result = await paymentsCollection.insertOne(paymentData);
 
-        // Update user premium status
         await user.updateOne(
             { _id: userDoc._id },
             {
@@ -1297,21 +1353,42 @@ app.post('/payments/checkout-verify', verifyToken, async (req, res) => {
             }
         );
 
-        res.send({
+        return res.status(200).send({
             success: true,
             message: "Payment verified successfully",
-            result
+            alreadyVerified: false,
+            payment: {
+                _id: result.insertedId,
+                ...paymentData
+            }
         });
 
     } catch (error) {
+        // Handle duplicate payment insertion
+        if (error.code === 11000) {
+            const existingPayment = await paymentsCollection.findOne({
+                stripeSessionId: req.body.sessionId
+            });
+
+            if (existingPayment) {
+                return res.status(200).send({
+                    success: true,
+                    message: "Payment already verified",
+                    alreadyVerified: true,
+                    payment: existingPayment
+                });
+            }
+        }
+
         console.error("Payment verification error:", error);
 
-        res.status(500).send({
+        return res.status(500).send({
             success: false,
             message: "Internal server error"
         });
     }
 });
+
 
 app.get('/payments', verifyToken, verifyAdmin, async (req, res) => {
     try {
