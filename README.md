@@ -102,26 +102,7 @@ cd mentorlagbe-server
 npm install
 ```
 
-### 4. Configure Environment Variables
-
-Create a `.env` file in the root directory and configure the required server environment variables.
-
-```env
-PORT=5000
-
-JWT_SECRET=your_jwt_secret
-
-STRIPE_SECRET_KEY=your_stripe_secret_key
-STRIPE_WEBHOOK_SECRET=your_stripe_webhook_secret
-
-CLIENT_URL=http://localhost:3000
-```
-
-Add any other environment variables required by your implementation.
-
-**Important:** Never expose sensitive credentials or secret keys in your GitHub repository.
-
-### 5. Run the Development Server
+### 4. Run the Development Server
 
 ```bash
 npm run dev
@@ -170,13 +151,11 @@ The backend is deployed on Vercel.
 - **Live API:** https://mentorlagbe-server-zeta.vercel.app/
 - **Client Application:** https://mentorlagbe-client-xi.vercel.app/
 
-Make sure all required environment variables are configured in the deployment platform before deploying.
-
 ## 👨‍💻 Author
 
 **Alhaz Uddin**
 
-- GitHub: https://github.com/alhazuddin07
+- GitHub: [Your GitHub Profile]
 - Project: MentorLagbe
 
 ---
