@@ -503,7 +503,6 @@ app.get('/applications', verifyToken, async (req, res) => {
             }
 
         } else if (req.query.applicantEmail) {
-            // Student নিজের applications দেখতে পারবে
             query.studentEmail = req.user.email;
         }
 
