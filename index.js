@@ -37,38 +37,64 @@ const sessions = db.collection("session");
 
 
 const verifyToken = async (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
-        res.send({ status: 401, message: "Unauthorized" });
-        return;
-    }
-    const token = authHeader.split(" ")[1];
-    if (!token) {
-        res.send({ status: 401, message: "Unauthorized" });
-        return;
-    }
+    try {
+        // Get Authorization header
+        const authHeader = req.headers.authorization;
 
-    const query = { token };
-    const session = await sessions.findOne(query);
-    if (!session) {
-        res.status(401).send({ message: "Unauthorized" });
-        return;
+        if (!authHeader || !authHeader.startsWith("Bearer ")) {
+            return res.status(401).send({
+                success: false,
+                message: "Unauthorized: Token missing"
+            });
+        }
+
+        // Extract token
+        const token = authHeader.split(" ")[1];
+
+        if (!token) {
+            return res.status(401).send({
+                success: false,
+                message: "Unauthorized: Invalid token"
+            });
+        }
+
+        // Find session
+        const session = await sessions.findOne({ token });
+
+        if (!session) {
+            return res.status(401).send({
+                success: false,
+                message: "Unauthorized: Invalid session"
+            });
+        }
+
+        // Find user
+        const userDoc = await user.findOne({
+            _id: new ObjectId(session.userId)
+        });
+
+        if (!userDoc) {
+            return res.status(401).send({
+                success: false,
+                message: "Unauthorized: User not found"
+            });
+        }
+
+        // Attach user to request
+        req.user = userDoc;
+
+        next();
+
+    } catch (error) {
+        console.error("Verify token error:", error);
+
+        return res.status(500).send({
+            success: false,
+            message: "Authentication failed"
+        });
     }
+};
 
-    const userId = session.userId;
-    const userQuery = { _id: new ObjectId(userId) }
-    // NOTE: don't name this `user` — it would shadow the `user` collection
-    // declared above and throw a TDZ ReferenceError on every request.
-    const userDoc = await user.findOne(userQuery);
-    if (!userDoc) {
-        res.status(401).send({ message: "Unauthorized" });
-        return;
-    }
-
-    req.user = userDoc;
-
-    next();
-}
 
 
 const verifyStudent = async (req, res, next) => {
@@ -87,9 +113,17 @@ const verifyTutor = async (req, res, next) => {
     next();
 };
 
+const verifyAdmin = async (req, res, next) => {
+    if (req.user.role !== "admin") {
+        res.status(403).send({ message: 'Forbidden' });
+        return;
+    }
+    next();
+};
+
 
 // users releted api
-app.get('/users', async (req, res) => {
+app.get('/users', verifyToken, verifyAdmin, async (req, res) => {
     const allUsers = await user.find().toArray();
 
     const result = allUsers.map((item) => ({
@@ -104,14 +138,14 @@ app.get('/users', async (req, res) => {
     res.send(result);
 })
 
-app.get('/users/:id/premium', async (req, res) => {
+app.get('/users/:id/premium', verifyToken, async (req, res) => {
     const id = req.params.id;
     const query = { _id: new ObjectId(id) };
     const result = await user.findOne(query, { projection: { premium: 1 } });
     res.send(result);
 })
 
-app.patch('/users/:id/status', async (req, res) => {
+app.patch('/users/:id/status', verifyToken, verifyAdmin, async (req, res) => {
     const id = req.params.id;
     const { status } = req.body;
 
@@ -124,6 +158,57 @@ app.patch('/users/:id/status', async (req, res) => {
 
     res.send(result)
 })
+
+app.patch('/users/:id/role', verifyToken, verifyAdmin, async (req, res) => {
+    try {
+        const id = req.params.id;
+        const { role } = req.body;
+
+        const allowedRoles = ["admin", "student", "tutor"];
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid user ID"
+            });
+        }
+
+        if (!allowedRoles.includes(role)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid role"
+            });
+        }
+
+        const result = await user.updateOne(
+            { _id: new ObjectId(id) },
+            {
+                $set: {
+                    role,
+                    updatedAt: new Date()
+                }
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).send({
+                success: false,
+                message: "User not found"
+            });
+        }
+
+        res.send({
+            success: true,
+            message: "User role updated successfully"
+        });
+
+    } catch (error) {
+        res.status(500).send({
+            success: false,
+            message: "Failed to update user role"
+        });
+    }
+});
 
 // tutions releted api
 
@@ -202,21 +287,34 @@ app.post('/tutions', verifyToken, verifyTutor, async (req, res) => {
     }
 })
 
-app.get('/tuitions/count/:tutorId', async (req, res) => {
+app.get('/tuitions/count/:tutorId', verifyToken, verifyTutor, async (req, res) => {
     try {
+        const { tutorId } = req.params;
+
+        if (req.user._id.toString() !== tutorId) {
+            return res.status(403).send({
+                success: false,
+                message: 'Forbidden access'
+            });
+        }
+
         const count = await tutions.countDocuments({
-            tutorId: req.params.tutorId
+            tutorId: tutorId
         });
 
         res.send({ count });
+
     } catch (error) {
         console.error('Tuition count error:', error);
-        res.status(500).send({ message: 'Failed to get tuition count' });
+
+        res.status(500).send({
+            message: 'Failed to get tuition count'
+        });
     }
-})
+});
 
 
-app.patch("/tuitions/:id/status", async (req, res) => {
+app.patch("/tuitions/:id/status", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const { id } = req.params;
         const { approvalStatus } = req.body;
@@ -269,24 +367,110 @@ app.patch("/tuitions/:id/status", async (req, res) => {
     }
 });
 
-app.get("/tutions/:id/applications/count", verifyToken, async (req, res) => {
+app.patch("/tuitions/:id/toggle-status", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { isActive } = req.body;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid tuition ID"
+            });
+        }
+
+        if (typeof isActive !== "boolean") {
+            return res.status(400).send({
+                success: false,
+                message: "Valid status is required"
+            });
+        }
+
+        // Find tuition
+        const tuition = await tutions.findOne({
+            _id: new ObjectId(id)
+        });
+
+        if (!tuition) {
+            return res.status(404).send({
+                success: false,
+                message: "Tuition not found"
+            });
+        }
+
+        // Check ownership
+        if (
+            tuition.tutorId?.toString() !==
+            req.user._id.toString()
+        ) {
+            return res.status(403).send({
+                success: false,
+                message: "Forbidden"
+            });
+        }
+
+        // Update status
+        const result = await tutions.updateOne(
+            { _id: new ObjectId(id) },
+            {
+                $set: {
+                    isActive,
+                    updatedAt: new Date()
+                }
+            }
+        );
+
+        res.send({
+            success: true,
+            message: `Tuition ${isActive ? "activated" : "deactivated"} successfully`,
+            result
+        });
+
+    } catch (error) {
+        console.error("Toggle tuition status error:", error);
+
+        res.status(500).send({
+            success: false,
+            message: "Failed to update tuition status",
+            error: error.message
+        });
+    }
+});
+
+app.get("/tutions/:id/applications/count", verifyToken, verifyTutor, async (req, res) => {
     try {
         const tuitionId = req.params.id;
 
+        // Check tuition ownership
+        const tuition = await tutions.findOne({
+            _id: new ObjectId(tuitionId),
+            tutorId: req.user._id.toString(),
+        });
+
+        if (!tuition) {
+            return res.status(404).send({
+                success: false,
+                message: "Tuition not found",
+            });
+        }
+
         const count = await applicationsCollection.countDocuments({
-            tuitionId: tuitionId
+            tuitionId,
         });
 
         res.send({ count });
 
     } catch (error) {
+        console.error("Application count error:", error);
+
         res.status(500).send({
-            message: "Failed to get application count"
+            message: "Failed to get application count",
         });
     }
-});
+}
+);
 
-app.get('/applications', async (req, res) => {
+app.get('/applications', verifyToken, async (req, res) => {
     try {
         const query = {};
 
@@ -309,17 +493,44 @@ app.get('/applications', async (req, res) => {
     }
 });
 
-app.get('/applications', verifyToken, async (req, res) => {
-    const query = {};
+app.get('/applications', verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const tuitionId = req.query.applicantId;
 
-    if (req.query.applicantId) {
-        query.tuitionId = req.query.applicantId;
+        if (!tuitionId) {
+            return res.status(400).send({
+                success: false,
+                message: "Tuition ID is required",
+            });
+        }
+
+        // Check tuition ownership
+        const tuition = await tutions.findOne({
+            _id: new ObjectId(tuitionId),
+            tutorId: req.user._id.toString(),
+        });
+
+        if (!tuition) {
+            return res.status(403).send({
+                success: false,
+                message: "You cannot access these applications",
+            });
+        }
+
+        const result = await applicationsCollection
+            .find({ tuitionId })
+            .toArray();
+
+        res.send(result);
+
+    } catch (error) {
+        console.error("Fetch applications error:", error);
+
+        res.status(500).send({
+            success: false,
+            message: "Failed to fetch applications",
+        });
     }
-
-    const cursor = applicationsCollection.find(query);
-    const result = await cursor.toArray();
-    res.send(result);
-
 });
 
 app.delete("/applications/:id", verifyToken, async (req, res) => {
@@ -407,149 +618,261 @@ app.get('/applications/count', verifyToken, async (req, res) => {
 });
 
 // Bookmarks related APIs
-app.get('/bookmarks/:userIdentifier', async (req, res) => {
+
+app.post("/bookmarks", verifyToken, verifyStudent, async (req, res) => {
     try {
-        const { userIdentifier } = req.params;
-        const query = {
-            $or: [
-                { userId: userIdentifier },
-                { userEmail: userIdentifier.toLowerCase() },
-            ],
-        };
-        const result = await bookmarksCollection.find(query).toArray();
-        res.send(result);
-    } catch (err) {
-        console.error("Error fetching bookmarks:", err);
-        res.status(500).send({ message: "Failed to fetch bookmarks" });
-    }
-});
+        const userId = req.user._id.toString();
+        const { tuitionId } = req.body;
 
-app.post('/bookmarks', async (req, res) => {
-    try {
-        const { userId, userEmail, tuitionId } = req.body;
-        if (!tuitionId) {
-            return res.status(400).send({ message: "tuitionId is required" });
-        }
-
-        const identifier = userId || userEmail;
-        if (!identifier) {
-            return res.status(400).send({ message: "User identification required" });
-        }
-
-        // Check user plan from user collection
-        const userDoc = userId && ObjectId.isValid(userId)
-            ? await user.findOne({ _id: new ObjectId(userId) })
-            : userEmail
-                ? await user.findOne({ email: userEmail.toLowerCase() })
-                : null;
-
-        const isPro = userDoc?.plan === "pro" || userDoc?.premium === true;
-
-        if (!isPro) {
-            const count = await bookmarksCollection.countDocuments({
-                $or: [
-                    { userId: identifier },
-                    { userEmail: (userEmail || identifier).toLowerCase() },
-                ],
+        // Validate tuitionId
+        if (!tuitionId || !ObjectId.isValid(tuitionId)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid tuition ID"
             });
-
-            if (count >= 5) {
-                return res.status(403).send({
-                    requiresPayment: true,
-                    message: "Free plan allows up to 5 bookmarks. Upgrade to Pro for unlimited bookmarks.",
-                });
-            }
         }
 
-        const existing = await bookmarksCollection.findOne({
-            $or: [
-                { userId: identifier, tuitionId },
-                { userEmail: (userEmail || identifier).toLowerCase(), tuitionId },
-            ],
+        // Find user
+        const currentUser = await user.findOne({
+            _id: new ObjectId(userId)
         });
 
-        if (existing) {
-            return res.send({ success: true, message: "Already bookmarked", bookmark: existing });
-        }
-
-        const newBookmark = {
-            userId: userId || null,
-            userEmail: userEmail ? userEmail.toLowerCase() : null,
-            tuitionId,
-            createdAt: new Date(),
-        };
-
-        const result = await bookmarksCollection.insertOne(newBookmark);
-        res.send({ success: true, bookmarkId: result.insertedId });
-    } catch (err) {
-        console.error("Error creating bookmark:", err);
-        res.status(500).send({ message: "Failed to save bookmark" });
-    }
-});
-
-app.delete('/bookmarks/:userIdentifier/:tuitionId', async (req, res) => {
-    try {
-        const { userIdentifier, tuitionId } = req.params;
-        const query = {
-            tuitionId,
-            $or: [
-                { userId: userIdentifier },
-                { userEmail: userIdentifier.toLowerCase() },
-            ],
-        };
-        await bookmarksCollection.deleteOne(query);
-        res.send({ success: true, message: "Bookmark removed" });
-    } catch (err) {
-        console.error("Error deleting bookmark:", err);
-        res.status(500).send({ message: "Failed to delete bookmark" });
-    }
-});
-
-app.patch("/applications/:id/status", async (req, res) => {
-    try {
-        const id = req.params.id;
-        const { status } = req.body;
-
-        const allowedStatus = ["Accepted", "Declined"];
-
-        if (!allowedStatus.includes(status)) {
-            return res.status(400).send({
-                message: "Invalid application status"
+        if (!currentUser) {
+            return res.status(404).send({
+                success: false,
+                message: "User not found"
             });
         }
 
-        const query = {
-            _id: new ObjectId(id),
-            status: { $in: ["pending", "Awaiting Decision"] }
+        // Check if already bookmarked
+        const existingBookmark = await bookmarksCollection.findOne({
+            userId,
+            tuitionId
+        });
+
+        if (existingBookmark) {
+            return res.status(409).send({
+                success: false,
+                message: "Already bookmarked"
+            });
+        }
+
+        // Check subscription plan
+        const isPro = currentUser.plan === "pro";
+
+        // Count existing bookmarks
+        const bookmarkCount = await bookmarksCollection.countDocuments({
+            userId
+        });
+
+        // Free student limit: 5 bookmarks
+        if (!isPro && bookmarkCount >= 5) {
+            return res.status(409).send({
+                success: false,
+                requiresPayment: true,
+                message: "Free students can bookmark only 5 tuitions. Upgrade to Pro for unlimited bookmarks."
+            });
+        }
+
+        // Create bookmark
+        const bookmark = {
+            userId,
+            userEmail: currentUser.email,
+            tuitionId,
+            createdAt: new Date()
         };
 
-        const result = await applicationsCollection.updateOne(
-            query,
-            {
-                $set: { status, updatedAt: new Date() }
-            }
-        );
+        const result = await bookmarksCollection.insertOne(bookmark);
 
-        if (result.matchedCount === 0) {
+        res.status(201).send({
+            success: true,
+            message: "Bookmark added successfully",
+            data: result
+        });
+
+    } catch (error) {
+        console.error("Add bookmark error:", error);
+
+        res.status(500).send({
+            success: false,
+            message: "Failed to add bookmark"
+        });
+    }
+});
+
+app.get("/bookmarks/:userId", verifyToken, verifyStudent, async (req, res) => {
+    try {
+        const { userId } = req.params;
+
+        const result = await bookmarksCollection.aggregate([
+            {
+                $match: { userId }
+            },
+            {
+                $addFields: {
+                    tuitionObjectId: {
+                        $toObjectId: "$tuitionId"
+                    }
+                }
+            },
+            {
+                $lookup: {
+                    from: "tutions",
+                    localField: "tuitionObjectId",
+                    foreignField: "_id",
+                    as: "tuition"
+                }
+            },
+            {
+                $unwind: "$tuition"
+            },
+            {
+                $project: {
+                    tuitionObjectId: 0
+                }
+            }
+        ]).toArray();
+
+        res.send({
+            success: true,
+            data: result
+        });
+
+    } catch (error) {
+        res.status(500).send({
+            success: false,
+            message: "Failed to fetch bookmarks"
+        });
+    }
+});
+
+app.delete("/bookmarks/:tuitionId", verifyToken, verifyStudent, async (req, res) => {
+    try {
+        const userId = req.user._id.toString();
+        const { tuitionId } = req.params;
+
+        if (!ObjectId.isValid(tuitionId)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid tuition ID",
+            });
+        }
+
+        const result = await bookmarksCollection.deleteOne({
+            userId,
+            tuitionId,
+        });
+
+        console.log("Delete Result:", result);
+
+        if (result.deletedCount === 0) {
             return res.status(404).send({
-                message: "Application not found or already reviewed"
+                success: false,
+                message: "Bookmark not found",
             });
         }
 
         res.send({
+            success: true,
+            message: "Bookmark removed successfully",
+        });
+    } catch (error) {
+        console.error("Remove bookmark error:", error);
+
+        res.status(500).send({
+            success: false,
+            message: error.message || "Failed to remove bookmark",
+        });
+    }
+});
+
+app.patch("/applications/:id/status", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        // Validate application ID
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid application ID"
+            });
+        }
+
+        // Validate status
+        const allowedStatus = ["Accepted", "Declined"];
+
+        if (!allowedStatus.includes(status)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid application status"
+            });
+        }
+
+        // Find application
+        const application = await applicationsCollection.findOne({
+            _id: new ObjectId(id)
+        });
+
+        if (!application) {
+            return res.status(404).send({
+                success: false,
+                message: "Application not found"
+            });
+        }
+
+        // Check tuition ownership
+        const tuition = await tutions.findOne({
+            _id: new ObjectId(application.tuitionId),
+            tutorId: req.user._id.toString()
+        });
+
+        if (!tuition) {
+            return res.status(403).send({
+                success: false,
+                message: "You are not allowed to update this application"
+            });
+        }
+
+        // Update application status
+        const result = await applicationsCollection.updateOne(
+            {
+                _id: new ObjectId(id),
+                status: { $in: ["pending", "Awaiting Decision"] }
+            },
+            {
+                $set: {
+                    status,
+                    updatedAt: new Date()
+                }
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(409).send({
+                success: false,
+                message: "Application already reviewed"
+            });
+        }
+
+        res.send({
+            success: true,
             message: "Application status updated successfully",
             result
         });
 
     } catch (error) {
+        console.error("Update application status error:", error);
+
         res.status(500).send({
-            message: "Something went wrong"
+            success: false,
+            message: "Failed to update application status"
         });
     }
 });
 
 // tuition application api
-app.post('/apply-tuitions', async (req, res) => {
+app.post('/apply-tuitions', verifyToken, verifyStudent, async (req, res) => {
     try {
         const { tuitionId, studentEmail, tutorEmail } = req.body;
 
@@ -608,6 +931,158 @@ app.get('/all-tuitions', async (req, res) => {
     res.send(result);
 });
 
+app.patch("/tuitions/:id", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const updatedData = req.body;
+
+        // Validate tuition ID
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid tuition ID"
+            });
+        }
+
+        // Find tuition
+        const tuition = await tutions.findOne({
+            _id: new ObjectId(id)
+        });
+
+        if (!tuition) {
+            return res.status(404).send({
+                success: false,
+                message: "Tuition not found"
+            });
+        }
+
+        // Check ownership
+        if (tuition.tutorId?.toString() !== req.user._id.toString()) {
+            return res.status(403).send({
+                success: false,
+                message: "You are not authorized to update this tuition"
+            });
+        }
+
+        // Allowed fields
+        const allowedFields = [
+            "title",
+            "subject",
+            "classLevel",
+            "mode",
+            "location",
+            "monthlyFee",
+            "daysPerWeek",
+            "description",
+            "bannerImage"
+        ];
+
+        const updateDoc = {};
+
+        allowedFields.forEach((field) => {
+            if (updatedData[field] !== undefined) {
+                updateDoc[field] = updatedData[field];
+            }
+        });
+
+        // Check empty update
+        if (Object.keys(updateDoc).length === 0) {
+            return res.status(400).send({
+                success: false,
+                message: "No valid fields to update"
+            });
+        }
+
+        updateDoc.updatedAt = new Date();
+
+        // Update tuition
+        const result = await tutions.updateOne(
+            { _id: new ObjectId(id) },
+            { $set: updateDoc }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).send({
+                success: false,
+                message: "Tuition not found"
+            });
+        }
+
+        res.status(200).send({
+            success: true,
+            message: "Tuition updated successfully",
+            result
+        });
+
+    } catch (error) {
+        console.error("Update tuition error:", error);
+
+        res.status(500).send({
+            success: false,
+            message: "Failed to update tuition",
+            error: error.message
+        });
+    }
+});
+
+app.delete("/tuitions/:id", verifyToken, verifyTutor, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        if (!ObjectId.isValid(id)) {
+            return res.status(400).send({
+                success: false,
+                message: "Invalid tuition ID"
+            });
+        }
+
+        const tuition = await tutions.findOne({
+            _id: new ObjectId(id)
+        });
+
+        if (!tuition) {
+            return res.status(404).send({
+                success: false,
+                message: "Tuition not found"
+            });
+        }
+
+        // Check ownership
+        if (tuition.tutorId?.toString() !== req.user._id.toString()) {
+            return res.status(403).send({
+                success: false,
+                message: "Forbidden"
+            });
+        }
+
+        const result = await tutions.deleteOne({
+            _id: new ObjectId(id)
+        });
+
+        if (result.deletedCount === 0) {
+            return res.status(404).send({
+                success: false,
+                message: "Tuition not found"
+            });
+        }
+
+        res.send({
+            success: true,
+            message: "Tuition deleted successfully",
+            result
+        });
+
+    } catch (error) {
+        console.error("Delete tuition error:", error);
+
+        res.status(500).send({
+            success: false,
+            message: "Failed to delete tuition",
+            error: error.message
+        });
+    }
+});
+
 app.get("/tuitions/:id", async (req, res) => {
     try {
         const id = req.params.id;
@@ -631,23 +1106,52 @@ app.get("/tuitions/:id", async (req, res) => {
     }
 });
 
-// tutions get (supports ?status=... and ?tutorEmail=...)
+
 app.get('/tutions', verifyToken, async (req, res) => {
     try {
         const query = {};
-        if (req.query.status) {
-            query.approvalStatus = req.query.status;
+
+        if (req.user.role === "admin") {
+            // Admin can see all tuitions
+            if (req.query.status) {
+                query.approvalStatus = req.query.status;
+            }
+
+            if (req.query.tutorEmail) {
+                query.tutorEmail = req.query.tutorEmail;
+            }
+
+        } else if (req.user.role === "tutor") {
+            // Tutor can see only own tuitions
+            query.tutorId = req.user._id.toString();
+
+            if (req.query.status) {
+                query.approvalStatus = req.query.status;
+            }
+
+        } else {
+            return res.status(403).send({
+                success: false,
+                message: "Forbidden access"
+            });
         }
-        if (req.query.tutorEmail) {
-            query.tutorEmail = req.query.tutorEmail;
-        }
-        const result = await tutions.find(query).sort({ createdAt: -1 }).toArray();
+
+        const result = await tutions
+            .find(query)
+            .sort({ createdAt: -1 })
+            .toArray();
+
         res.send(result);
+
     } catch (err) {
         console.error("Error fetching tuitions:", err);
-        res.status(500).send({ message: "Failed to fetch tuitions" });
+
+        res.status(500).send({
+            success: false,
+            message: "Failed to fetch tuitions"
+        });
     }
-})
+});
 
 app.get("/browse-tuitions", async (req, res) => {
     try {
@@ -673,7 +1177,7 @@ app.get("/browse-tuitions", async (req, res) => {
 });
 
 // payments releted api
-app.post('/payments/checkout-verify', async (req, res) => {
+app.post('/payments/checkout-verify', verifyToken, async (req, res) => {
     try {
         const { sessionId } = req.body;
 
@@ -809,7 +1313,7 @@ app.post('/payments/checkout-verify', async (req, res) => {
     }
 });
 
-app.get('/payments', async (req, res) => {
+app.get('/payments', verifyToken, verifyAdmin, async (req, res) => {
     try {
         const result = await paymentsCollection.find().sort({ paidAt: -1 }).toArray();
         res.send(result);
